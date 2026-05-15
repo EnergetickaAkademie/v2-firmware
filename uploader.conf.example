@@ -1,0 +1,11 @@
+[ports]
+filter_regex = ^/dev/ttyACM\d+$
+
+[mainboard]
+wifi_ssid = ssid
+wifi_password = password
+
+server_endpoint = http://enak.server.example/coreapi
+
+board_username = board_usr
+board_password = board_pwd

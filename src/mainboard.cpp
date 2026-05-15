@@ -1,6 +1,30 @@
 #include <Arduino.h>
 #include <cstring>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include "PeripheralFactory.h"
+
+// --- Network & API Configuration ---
+#ifndef WIFI_SSID
+#define WIFI_SSID "YOUR_SSID"
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "YOUR_PASSWORD"
+#endif
+#ifndef API_BASE_URL
+#define API_BASE_URL "http://192.168.1.100/coreapi"
+#endif
+#ifndef BOARD_USERNAME
+#define BOARD_USERNAME "board1"
+#endif
+#ifndef BOARD_PASSWORD
+#define BOARD_PASSWORD "board123"
+#endif
+
+String jwtToken = "";
+unsigned long lastNetworkRetry = 0;
+const unsigned long NETWORK_RETRY_INTERVAL = 5000;
 
 // Hardware Pins
 #define OUT_LATCH_PIN 10
@@ -26,7 +50,7 @@
 #define DISPLAY_DIGIT_COUNT 8
 #define DEVICE_COUNT 6
 #define INPUT_REGISTER_COUNT 3
-#define SUBSTATION_UART_BAUD 9600 
+#define SUBSTATION_UART_BAUD 9600
 
 PeripheralFactory factory;
 ShiftRegisterChain* outChain = nullptr;
@@ -46,305 +70,260 @@ HardwareSerial subSerial1(1);
 HardwareSerial subSerial2(2);
 HardwareSerial subSerial3(0);
 
-// Array map: 0=NPP, 1=GAS, 2=BAT, 3=COAL, 4=WIND, 5=HYDRO
 const uint8_t indexToType[DEVICE_COUNT] = {4, 6, 2, 1, 3, 5};
 int32_t lastSentValues[DEVICE_COUNT] = {-1, -1, -1, -1, -1, -1};
 
 SemaphoreHandle_t hardwareMutex;
 TaskHandle_t PeripheralTaskHandle;
 
-// Substation State Machine Struct
-struct Substation {
-    HardwareSerial* port;
-    String buffer;
-    uint32_t lastAlive;
-    bool online;
-    uint8_t counts[7];
-    bool needsUpdate[DEVICE_COUNT];
+uint32_t currentTotalProduction_mW = 0;
+uint32_t currentTotalConsumption_mW = 0;
+
+unsigned long lastPollMs = 0;
+const unsigned long POLL_INTERVAL = 2000;
+unsigned long lastPostMs = 0;
+const unsigned long POST_INTERVAL = 1000;
+
+uint32_t swap_uint32(uint32_t val) {
+    return (val << 24) | ((val << 8) & 0x00FF0000) |
+           ((val >> 8) & 0x0000FF00) | (val >> 24);
+}
+
+int32_t readBE32(WiFiClient* stream) {
+    uint8_t buf[4];
+    if (stream->readBytes(buf, 4) == 4) {
+        return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+    }
+    return 0;
+}
+
+void pollGameState() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/poll_binary");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
     
-    void init(HardwareSerial* p, int rx, int tx) {
-        port = p;
-        port->begin(SUBSTATION_UART_BAUD, SERIAL_8N1, rx, tx);
-        buffer = "";
-        online = false;
-        lastAlive = 0;
-        memset(counts, 0, sizeof(counts));
-        for(int i=0; i<DEVICE_COUNT; i++) needsUpdate[i] = true; 
-    }
-
-    void send(const char* cmd) {
-        port->println(cmd);
-    }
-};
-
-Substation subs[3];
-uint8_t totalCounts[7] = {0};
-
-uint32_t lastReportMs = 0;
-uint32_t lastLedToggleMs = 0;
-bool ledState = false;
-LED* statusLed = nullptr;
-
-// --- Data Processing & UI ---
-
-void updateTotalCounts() {
-    memset(totalCounts, 0, sizeof(totalCounts));
-    for (int s = 0; s < 3; s++) {
-        if (millis() - subs[s].lastAlive > 3000) {
-            subs[s].online = false;
-            memset(subs[s].counts, 0, sizeof(subs[s].counts));
-        }
+    int httpCode = http.GET();
+    
+    if (httpCode == 200) {
+        WiFiClient* stream = http.getStreamPtr();
         
-        if (subs[s].online) {
-            for (int i = 0; i < 7; i++) {
-                totalCounts[i] += subs[s].counts[i];
-            }
-        }
-    }
-}
-
-void updateDisplays() {
-    updateTotalCounts();
-
-    coalDisplay.displayNumber(totalCounts[3], 0);
-    hydroDisplay.displayNumber(totalCounts[5], 0);
-    gasDisplay.displayNumber(totalCounts[1], 0);
-    nuclearDisplay.displayNumber(totalCounts[0], 0);
-    batteryDisplay.displayNumber(totalCounts[2], 0);
-    windPvDisplay.displayNumber(totalCounts[4], 0);
-
-    // Show zeros on the totals displays for now
-    if (consumptionDisp) consumptionDisp->displayNumber(0, 0);
-    if (productionDisp) productionDisp->displayNumber(0, 0);
-}
-
-void updateBargraphs() {
-    const size_t deviceCount = min(encoders.size(), bargraphs.size());
-    for (size_t i = 0; i < deviceCount; ++i) {
-        int32_t val = encoders[i] ? encoders[i]->get_value() : 0;
-        val = constrain(val, ENCODER_MIN_VALUE, ENCODER_MAX_VALUE);
-        uint8_t bgVal = static_cast<uint8_t>(map(val, ENCODER_MIN_VALUE, ENCODER_MAX_VALUE, 0, BARGRAPH_LED_COUNT));
-        bargraphs[i]->setValue(bgVal);
-    }
-}
-
-// --- Background Task ---
-
-void peripheralTask(void *pvParameters) {
-    for (;;) {
-        xSemaphoreTake(hardwareMutex, portMAX_DELAY);
-        factory.update();
-        xSemaphoreGive(hardwareMutex);
-        vTaskDelay(pdMS_TO_TICKS(1)); 
-    }
-}
-
-// --- Serial Communications Protocol ---
-
-void processSubstationLine(int subIndex, String line) {
-    line.trim();
-    if (line.length() == 0) return;
-
-    Substation& sub = subs[subIndex];
-
-    if (line == "I'm alive") {
-        sub.lastAlive = millis();
-        sub.online = true;
-        
-        vTaskDelay(pdMS_TO_TICKS(5)); 
-        sub.send("COUNTS?"); 
-        
-        vTaskDelay(pdMS_TO_TICKS(100)); 
-        
-        int sentThisCycle = 0;
-        for (int i = 0; i < DEVICE_COUNT; i++) {
-            bool requiresUpdate = false;
+        // Only parse if we have data (server might return empty 200 OK if game is paused/ended)
+        if (stream->available() >= 1) {
+            Serial.println("\n=== [Game State Update] ===");
             
-            xSemaphoreTake(hardwareMutex, portMAX_DELAY);
-            if (sub.needsUpdate[i]) {
-                requiresUpdate = true;
-                sub.needsUpdate[i] = false;
+            // 1. Read Production Coefficients
+            uint8_t prod_count = stream->read();
+            Serial.printf("Production Sources (%d):\n", prod_count);
+            for (int i = 0; i < prod_count; i++) {
+                uint8_t source_id = stream->read();
+                int32_t coeff_mw = readBE32(stream);
+                float coeff = coeff_mw / 1000.0;
+                Serial.printf("  -> Source ID: %d | Coeff: %.3f\n", source_id, coeff);
             }
-            xSemaphoreGive(hardwareMutex);
-
-            if (requiresUpdate) {
-                uint8_t type = indexToType[i];
-                int32_t val = lastSentValues[i];
-                
-                uint8_t r = 0, g = 0, b = 0;
-                if (val < 20) { r = 255; g = 0; b = 0; }
-                else if (val > 50) { r = 0; g = 255; b = 0; }
-                else { r = 255; g = 255; b = 0; }
-
-                char cmd[32];
-                snprintf(cmd, sizeof(cmd), "RGB %d %d %d %d", type, r, g, b);
-                sub.send(cmd);
-                
-                vTaskDelay(pdMS_TO_TICKS(80)); 
-
-                snprintf(cmd, sizeof(cmd), "MOTOR %d %d", type, val > 0 ? 1 : 0);
-                sub.send(cmd);
-                
-                vTaskDelay(pdMS_TO_TICKS(80));
-
-                sentThisCycle++;
-                
-                if (sentThisCycle >= 2) break; 
+            
+            // 2. Read Consumption Coefficients (Building baseline consumptions)
+            if (stream->available() >= 1) {
+                uint8_t cons_count = stream->read();
+                Serial.printf("Consumer Types (%d):\n", cons_count);
+                for (int i = 0; i < cons_count; i++) {
+                    uint8_t building_id = stream->read();
+                    int32_t cons_mw = readBE32(stream);
+                    float consumption_w = cons_mw / 1000.0;
+                    Serial.printf("  -> Building ID: %d | Base Consumption: %.3f MW\n", building_id, consumption_w);
+                }
             }
-        }
-    }
-    else if (line.startsWith("Type ")) {
-        int type, count;
-        if (sscanf(line.c_str(), "Type %d: %d", &type, &count) == 2) {
-            if (type >= 1 && type <= 7) {
-                xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+            
+            // 3. Read Connected Buildings (For NFC persistence)
+            if (stream->available() >= 1) {
+                uint8_t buildings_count = stream->read();
+                Serial.printf("Connected Buildings on this Board (%d):\n", buildings_count);
                 
-                if (count > sub.counts[type - 1]) {
-                    for (int i = 0; i < DEVICE_COUNT; i++) {
-                        if (indexToType[i] == type) {
-                            sub.needsUpdate[i] = true;
-                            break;
+                for (int i = 0; i < buildings_count; i++) {
+                    if (stream->available() >= 1) {
+                        uint8_t uid_len = stream->read();
+                        
+                        // Read the UID string
+                        char uid_buf[256]; 
+                        memset(uid_buf, 0, sizeof(uid_buf));
+                        if (uid_len > 0 && stream->available() >= uid_len) {
+                            stream->readBytes((uint8_t*)uid_buf, uid_len);
                         }
+                        
+                        // Read the building type
+                        uint8_t building_type = 0;
+                        if (stream->available() >= 1) {
+                            building_type = stream->read();
+                        }
+                        
+                        Serial.printf("  -> UID: %s | Type: %d\n", uid_buf, building_type);
                     }
                 }
-                
-                sub.counts[type - 1] = count;
-                xSemaphoreGive(hardwareMutex);
             }
+            Serial.println("===========================\n");
+        } else {
+            // Server returned 200 OK but no data -> Game is inactive/ended
+            Serial.println("[Game State] Server returned empty payload. Game might be paused or ended.");
         }
+    } else {
+         Serial.printf("[Net] Poll failed. HTTP Code: %d\n", httpCode);
     }
+    
+    http.end();
 }
 
-// --- Main Architecture ---
+void postTelemetry() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/post_vals");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    http.addHeader("Content-Type", "application/octet-stream");
+
+    // Format: production(4) + consumption(4) + buildings_count(1) = 9 bytes
+    uint8_t payload[9];
+    
+    // Pack Production (Big Endian)
+    payload[0] = (currentTotalProduction_mW >> 24) & 0xFF;
+    payload[1] = (currentTotalProduction_mW >> 16) & 0xFF;
+    payload[2] = (currentTotalProduction_mW >> 8) & 0xFF;
+    payload[3] = currentTotalProduction_mW & 0xFF;
+    
+    // Pack Consumption (Big Endian)
+    payload[4] = (currentTotalConsumption_mW >> 24) & 0xFF;
+    payload[5] = (currentTotalConsumption_mW >> 16) & 0xFF;
+    payload[6] = (currentTotalConsumption_mW >> 8) & 0xFF;
+    payload[7] = currentTotalConsumption_mW & 0xFF;
+    
+    // Pack Buildings Count (0 for now)
+    payload[8] = 0;
+
+    int httpCode = http.POST(payload, sizeof(payload));
+    
+    if (httpCode != 200) {
+        Serial.printf("[Net] Telemetry POST failed. Code: %d\n", httpCode);
+    }
+    
+    http.end();
+}
+
+void connectWiFi() {
+    if (WiFi.status() == WL_CONNECTED) return;
+    
+    Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+bool authenticate() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    String loginUrl = String(API_BASE_URL) + "/login";
+    http.begin(loginUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    StaticJsonDocument<200> doc;
+    doc["username"] = BOARD_USERNAME;
+    doc["password"] = BOARD_PASSWORD;
+    
+    String requestBody;
+    serializeJson(doc, requestBody);
+
+    int httpCode = http.POST(requestBody);
+    bool success = false;
+
+    if (httpCode == 200) {
+        String payload = http.getString();
+        StaticJsonDocument<512> responseDoc;
+        DeserializationError error = deserializeJson(responseDoc, payload);
+        
+        if (!error && responseDoc.containsKey("token")) {
+            jwtToken = responseDoc["token"].as<String>();
+            Serial.println("[Net] Authentication successful. Token acquired.");
+            success = true;
+        }
+    } else {
+        Serial.printf("[Net] Auth failed. HTTP Code: %d\n", httpCode);
+    }
+
+    http.end();
+    return success;
+}
+
+bool registerBoard() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    String regUrl = String(API_BASE_URL) + "/register";
+    http.begin(regUrl);
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    
+    int httpCode = http.POST("");
+    bool success = false;
+
+    if (httpCode == 200) {
+        // According to binary_protocol.py, response is: success(1) + message_len(1) + message
+        WiFiClient* stream = http.getStreamPtr();
+        if (stream->available() >= 2) {
+            uint8_t status = stream->read();
+            uint8_t len = stream->read();
+            if (status == 1) {
+                Serial.println("[Net] Board binary registration successful.");
+                success = true;
+            }
+        }
+    } else {
+        Serial.printf("[Net] Registration failed. HTTP Code: %d\n", httpCode);
+        jwtToken = ""; // Force re-auth on next cycle
+    }
+    
+    http.end();
+    return success;
+}
+
+void networkTask() {
+    unsigned long now = millis();
+
+    // 1. Handle Connection & Auth
+    if (WiFi.status() != WL_CONNECTED) {
+        if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
+            lastNetworkRetry = now;
+            connectWiFi();
+        }
+        return;
+    }
+
+    if (jwtToken == "") {
+        if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
+            lastNetworkRetry = now;
+            if (authenticate()) {
+                registerBoard();
+            }
+        }
+        return; // Don't try to poll/post without a token
+    }
+
+    // 2. Poll Game State from API
+    if (now - lastPollMs >= POLL_INTERVAL) {
+        lastPollMs = now;
+        pollGameState();
+    }
+
+    // 3. Post Hardware State to API
+    if (now - lastPostMs >= POST_INTERVAL) {
+        lastPostMs = now;
+        postTelemetry();
+    }
+}
 
 void setup() {
     Serial.begin(115200);
-    delay(3000); 
-    Serial.println("[Main] Booting ESP32-S3...");
-
-    hardwareMutex = xSemaphoreCreateMutex();
-
-    statusLed = factory.createLed(STATUS_LED_PIN);
-
-    subs[0].init(&subSerial1, SUB1_RX_PIN, SUB1_TX_PIN);
-    subs[1].init(&subSerial2, SUB2_RX_PIN, SUB2_TX_PIN);
-    subs[2].init(&subSerial3, SUB3_RX_PIN, SUB3_TX_PIN);
-    Serial.println("[Main] 3 Raw Hardware UARTs initialized");
-
-    outChain = factory.createShiftRegisterChain(OUT_LATCH_PIN, OUT_DATA_PIN, SHARED_CLOCK_PIN);
-    inChain = factory.createInputShiftRegisterChain(IN_LOAD_PIN, IN_DATA_PIN, SHARED_CLOCK_PIN, INPUT_REGISTER_COUNT);
-
-    encoders.reserve(DEVICE_COUNT);
-    buttons.reserve(DEVICE_COUNT);
-    bargraphs.reserve(DEVICE_COUNT);
-
-    const uint8_t encoderRegisterIndex[DEVICE_COUNT] = {0, 0, 1, 1, 2, 2};
-    const uint8_t encoderBitPosition[DEVICE_COUNT]   = {0, 3, 0, 3, 0, 3};
-    const uint8_t buttonRegisterIndex[DEVICE_COUNT]  = {0, 0, 1, 1, 2, 2};
-    const uint8_t buttonBitPosition[DEVICE_COUNT]    = {2, 5, 2, 5, 2, 5};
-
-    for (uint8_t i = 0; i < DEVICE_COUNT; ++i) {
-        encoders.push_back(factory.createShiftEncoder(inChain, encoderRegisterIndex[i], encoderBitPosition[i], ENCODER_MIN_VALUE, ENCODER_MAX_VALUE, ENCODER_STEP));
-        buttons.push_back(factory.createShiftButton(inChain, buttonRegisterIndex[i], buttonBitPosition[i], true));
-    }
-
-    productionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
-    consumptionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
-
-    Bargraph* bg5 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    Bargraph* bg4 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    disp3 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
-    
-    Bargraph* bg3 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    Bargraph* bg2 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    disp2 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
-    
-    Bargraph* bg1 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    Bargraph* bg0 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-    disp1 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
-
-    bargraphs.push_back(bg0);
-    bargraphs.push_back(bg1);
-    bargraphs.push_back(bg2);
-    bargraphs.push_back(bg3);
-    bargraphs.push_back(bg4);
-    bargraphs.push_back(bg5);
-
-    coalDisplay = disp1.left();
-    hydroDisplay = disp1.right();
-    gasDisplay = disp2.left();
-    nuclearDisplay = disp2.right();
-    batteryDisplay = disp3.left();
-    windPvDisplay = disp3.right();
-
-    for (ShiftEncoder* encoder : encoders) {
-        if (encoder) encoder->set_value(50);
-    }
-
-    factory.createPeriodic(20, updateDisplays);
-    factory.createPeriodic(50, updateBargraphs);
-
-    xTaskCreatePinnedToCore(
-        peripheralTask,   
-        "PeripheralTask", 
-        4096,             
-        NULL,             
-        1,                
-        &PeripheralTaskHandle, 
-        0                 
-    );
+    delay(100);
+    connectWiFi();
 }
 
 void loop() {
-    const uint32_t now = millis();
-
-    if (now - lastLedToggleMs >= 500) {
-        lastLedToggleMs = now;
-        ledState = !ledState;
-        
-        xSemaphoreTake(hardwareMutex, portMAX_DELAY);
-        if (statusLed) statusLed->setState(ledState);
-        xSemaphoreGive(hardwareMutex);
-    }
-
-    xSemaphoreTake(hardwareMutex, portMAX_DELAY);
-    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-        int32_t val = encoders[i] ? encoders[i]->get_value() : 0;
-        val = constrain(val, ENCODER_MIN_VALUE, ENCODER_MAX_VALUE);
-
-        if (val != lastSentValues[i]) {
-            lastSentValues[i] = val;
-            for(int s = 0; s < 3; s++) {
-                subs[s].needsUpdate[i] = true;
-            }
-        }
-    }
-    xSemaphoreGive(hardwareMutex);
-
-    for (int s = 0; s < 3; s++) {
-        while (subs[s].port->available() > 0) {
-            char c = subs[s].port->read();
-            if (c == '\n') {
-                processSubstationLine(s, subs[s].buffer);
-                subs[s].buffer = "";
-            } else if (c != '\r') {
-                subs[s].buffer += c;
-            }
-        }
-    }
-
-    if (now - lastReportMs >= 2000) {
-        lastReportMs = now;
-        uint8_t detected = 0;
-        
-        xSemaphoreTake(hardwareMutex, portMAX_DELAY);
-        for (int s = 0; s < 3; s++) {
-            if (subs[s].online) detected++;
-        }
-        
-        Serial.printf("[Status] Substations Online: %d/3\n", detected);
-        Serial.printf("[Grid Data] NPP=%d GAS=%d BAT=%d COAL=%d WIND=%d HYD=%d PUMP=%d\n",
-            totalCounts[0], totalCounts[1], totalCounts[2], totalCounts[3], totalCounts[4], totalCounts[5], totalCounts[6]);
-        xSemaphoreGive(hardwareMutex);
-    }
+    networkTask();
+    delay(10);
 }
