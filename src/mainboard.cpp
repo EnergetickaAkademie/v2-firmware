@@ -39,6 +39,9 @@ std::vector<Bargraph*> bargraphs;
 SegmentDisplayPair disp1, disp2, disp3;
 SegmentDisplayPair::Half coalDisplay, hydroDisplay, gasDisplay, nuclearDisplay, batteryDisplay, windPvDisplay;
 
+SegmentDisplay* consumptionDisp = nullptr;
+SegmentDisplay* productionDisp = nullptr;
+
 HardwareSerial subSerial1(1);
 HardwareSerial subSerial2(2);
 HardwareSerial subSerial3(0);
@@ -109,6 +112,10 @@ void updateDisplays() {
     nuclearDisplay.displayNumber(totalCounts[0], 0);
     batteryDisplay.displayNumber(totalCounts[2], 0);
     windPvDisplay.displayNumber(totalCounts[4], 0);
+
+    // Show zeros on the totals displays for now
+    if (consumptionDisp) consumptionDisp->displayNumber(0, 0);
+    if (productionDisp) productionDisp->displayNumber(0, 0);
 }
 
 void updateBargraphs() {
@@ -240,6 +247,9 @@ void setup() {
         encoders.push_back(factory.createShiftEncoder(inChain, encoderRegisterIndex[i], encoderBitPosition[i], ENCODER_MIN_VALUE, ENCODER_MAX_VALUE, ENCODER_STEP));
         buttons.push_back(factory.createShiftButton(inChain, buttonRegisterIndex[i], buttonBitPosition[i], true));
     }
+
+    productionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
+    consumptionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
 
     Bargraph* bg5 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
     Bargraph* bg4 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
