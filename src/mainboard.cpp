@@ -1,56 +1,9 @@
 #include <Arduino.h>
-#include <cstring>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
+#include <vector>
+#include "Config.h"
+#include "GameState.h"
+#include "NetworkManager.h"
 #include "PeripheralFactory.h"
-
-// --- Network & API Configuration ---
-#ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_SSID"
-#endif
-#ifndef WIFI_PASS
-#define WIFI_PASS "YOUR_PASSWORD"
-#endif
-#ifndef API_BASE_URL
-#define API_BASE_URL "http://192.168.1.100/coreapi"
-#endif
-#ifndef BOARD_USERNAME
-#define BOARD_USERNAME "board1"
-#endif
-#ifndef BOARD_PASSWORD
-#define BOARD_PASSWORD "board123"
-#endif
-
-String jwtToken = "";
-unsigned long lastNetworkRetry = 0;
-const unsigned long NETWORK_RETRY_INTERVAL = 5000;
-
-// Hardware Pins
-#define OUT_LATCH_PIN 10
-#define OUT_DATA_PIN  11
-#define SHARED_CLOCK_PIN 12
-#define IN_DATA_PIN 13
-#define IN_LOAD_PIN 14
-
-#define SUB1_RX_PIN 43
-#define SUB1_TX_PIN 44
-#define SUB2_RX_PIN 17
-#define SUB2_TX_PIN 18
-#define SUB3_RX_PIN 9
-#define SUB3_TX_PIN 8
-
-#define STATUS_LED_PIN 38
-
-// System Constants
-#define ENCODER_MIN_VALUE 0
-#define ENCODER_MAX_VALUE 100
-#define ENCODER_STEP -1
-#define BARGRAPH_LED_COUNT 10
-#define DISPLAY_DIGIT_COUNT 8
-#define DEVICE_COUNT 6
-#define INPUT_REGISTER_COUNT 3
-#define SUBSTATION_UART_BAUD 9600
 
 PeripheralFactory factory;
 ShiftRegisterChain* outChain = nullptr;
@@ -62,7 +15,6 @@ std::vector<Bargraph*> bargraphs;
 
 SegmentDisplayPair disp1, disp2, disp3;
 SegmentDisplayPair::Half coalDisplay, hydroDisplay, gasDisplay, nuclearDisplay, batteryDisplay, windPvDisplay;
-
 SegmentDisplay* consumptionDisp = nullptr;
 SegmentDisplay* productionDisp = nullptr;
 
@@ -70,361 +22,371 @@ HardwareSerial subSerial1(1);
 HardwareSerial subSerial2(2);
 HardwareSerial subSerial3(0);
 
-const uint8_t indexToType[DEVICE_COUNT] = {4, 6, 2, 1, 3, 5};
+// Hardware mapping for sending RGB commands to substations
+const uint8_t hwTypeMap[DEVICE_COUNT] = {4, 6, 2, 1, 3, 5};
 int32_t lastSentValues[DEVICE_COUNT] = {-1, -1, -1, -1, -1, -1};
 
 SemaphoreHandle_t hardwareMutex;
 TaskHandle_t PeripheralTaskHandle;
+uint32_t lastLedToggleMs = 0;
+bool ledState = false;
+LED* statusLed = nullptr;
 
-uint32_t currentTotalProduction_MW = 0;
-uint32_t currentTotalConsumption_MW = 0;
+struct Substation {
+    HardwareSerial* port;
+    String buffer;
+    uint32_t lastAlive;
+    bool online;
+    uint8_t counts[7];
+    bool needsUpdate[DEVICE_COUNT];
+    
+    void init(HardwareSerial* p, int rx, int tx) {
+        port = p;
+        port->begin(SUBSTATION_UART_BAUD, SERIAL_8N1, rx, tx);
+        buffer = "";
+        online = false;
+        lastAlive = 0;
+        memset(counts, 0, sizeof(counts));
+        for(int i=0; i<DEVICE_COUNT; i++) needsUpdate[i] = true; 
+    }
 
-unsigned long lastPollMs = 0;
-const unsigned long POLL_INTERVAL = 2000;
-unsigned long lastPostMs = 0;
-const unsigned long POST_INTERVAL = 1000;
+    void send(const char* cmd) {
+        port->println(cmd);
+    }
+};
 
-uint32_t swap_uint32(uint32_t val) {
-	return (val << 24) | ((val << 8) & 0x00FF0000) |
-		   ((val >> 8) & 0x0000FF00) | (val >> 24);
+Substation subs[3];
+uint8_t totalCounts[7] = {0};
+
+void peripheralTask(void *pvParameters) {
+    for (;;) {
+        xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+        factory.update();
+        xSemaphoreGive(hardwareMutex);
+        vTaskDelay(pdMS_TO_TICKS(1)); 
+    }
 }
 
-int32_t readBE32(WiFiClient* stream) {
-	uint8_t buf[4];
-	if (stream->readBytes(buf, 4) == 4) {
-		return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
-	}
-	return 0;
+void processSubstationLine(int subIndex, String line) {
+    line.trim();
+    if (line.length() == 0) return;
+
+    Substation& sub = subs[subIndex];
+
+    if (line == "I'm alive") {
+        sub.lastAlive = millis();
+        sub.online = true;
+        
+        vTaskDelay(pdMS_TO_TICKS(5)); 
+        sub.send("COUNTS?"); 
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+        
+        int sentThisCycle = 0;
+        for (int i = 0; i < DEVICE_COUNT; i++) {
+            bool requiresUpdate = false;
+            
+            xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+            if (sub.needsUpdate[i]) {
+                requiresUpdate = true;
+                sub.needsUpdate[i] = false;
+            }
+            xSemaphoreGive(hardwareMutex);
+
+            if (requiresUpdate) {
+                uint8_t type = hwTypeMap[i];
+                int32_t val = lastSentValues[i];
+                
+                uint8_t r = 0, g = 0, b = 0;
+                if (val < 20) { r = 255; g = 0; b = 0; }
+                else if (val > 50) { r = 0; g = 255; b = 0; }
+                else { r = 255; g = 255; b = 0; }
+
+                char cmd[32];
+                snprintf(cmd, sizeof(cmd), "RGB %d %d %d %d", type, r, g, b);
+                sub.send(cmd);
+                vTaskDelay(pdMS_TO_TICKS(80)); 
+
+                snprintf(cmd, sizeof(cmd), "MOTOR %d %d", type, val > 0 ? 1 : 0);
+                sub.send(cmd);
+                vTaskDelay(pdMS_TO_TICKS(80));
+
+                sentThisCycle++;
+                if (sentThisCycle >= 2) break; 
+            }
+        }
+    }
+    else if (line.startsWith("Type ")) {
+        int type, count;
+        if (sscanf(line.c_str(), "Type %d: %d", &type, &count) == 2) {
+            if (type >= 1 && type <= 7) {
+                xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+                if (count > sub.counts[type - 1]) {
+                    for (int i = 0; i < DEVICE_COUNT; i++) {
+                        if (hwTypeMap[i] == type) {
+                            sub.needsUpdate[i] = true;
+                            break;
+                        }
+                    }
+                }
+                sub.counts[type - 1] = count;
+                xSemaphoreGive(hardwareMutex);
+            }
+        }
+    }
 }
 
-void pollGameState() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-
-	HTTPClient http;
-	http.begin(String(API_BASE_URL) + "/poll_binary");
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	
-	int httpCode = http.GET();
-	
-	if (httpCode == 200) {
-		WiFiClient* stream = http.getStreamPtr();
-		
-		// Only parse if we have data (server might return empty 200 OK if game is paused/ended)
-		if (stream->available() >= 1) {
-			Serial.println("\n=== [Game State Update] ===");
-			
-			// 1. Read Production Coefficients
-			uint8_t prod_count = stream->read();
-			Serial.printf("Production Sources (%d):\n", prod_count);
-			for (int i = 0; i < prod_count; i++) {
-				uint8_t source_id = stream->read();
-				int32_t coeff_mw = readBE32(stream);
-				float coeff = coeff_mw / 1000.0;
-				Serial.printf("  -> Source ID: %d | Coeff: %.3f\n", source_id, coeff);
-			}
-			
-			// 2. Read Consumption Coefficients (Building baseline consumptions)
-			if (stream->available() >= 1) {
-				uint8_t cons_count = stream->read();
-				Serial.printf("Consumer Types (%d):\n", cons_count);
-				for (int i = 0; i < cons_count; i++) {
-					uint8_t building_id = stream->read();
-					int32_t cons_mw = readBE32(stream);
-					float consumption_w = cons_mw / 1000.0;
-					Serial.printf("  -> Building ID: %d | Base Consumption: %.3f MW\n", building_id, consumption_w);
-				}
-			}
-			
-			// 3. Read Connected Buildings (For NFC persistence)
-			if (stream->available() >= 1) {
-				uint8_t buildings_count = stream->read();
-				Serial.printf("Connected Buildings on this Board (%d):\n", buildings_count);
-				
-				for (int i = 0; i < buildings_count; i++) {
-					if (stream->available() >= 1) {
-						uint8_t uid_len = stream->read();
-						
-						// Read the UID string
-						char uid_buf[256]; 
-						memset(uid_buf, 0, sizeof(uid_buf));
-						if (uid_len > 0 && stream->available() >= uid_len) {
-							stream->readBytes((uint8_t*)uid_buf, uid_len);
-						}
-						
-						// Read the building type
-						uint8_t building_type = 0;
-						if (stream->available() >= 1) {
-							building_type = stream->read();
-						}
-						
-						Serial.printf("  -> UID: %s | Type: %d\n", uid_buf, building_type);
-					}
-				}
-			}
-			Serial.println("===========================\n");
-		} else {
-			// Server returned 200 OK but no data -> Game is inactive/ended
-			Serial.println("[Game State] Server returned empty payload. Game might be paused or ended.");
-		}
-	} else {
-		 Serial.printf("[Net] Poll failed. HTTP Code: %d\n", httpCode);
-	}
-	
-	http.end();
+void updateTotalCounts() {
+    memset(totalCounts, 0, sizeof(totalCounts));
+    for (int s = 0; s < 3; s++) {
+        if (millis() - subs[s].lastAlive > 3000) {
+            subs[s].online = false;
+            memset(subs[s].counts, 0, sizeof(subs[s].counts));
+        }
+        if (subs[s].online) {
+            for (int i = 0; i < 7; i++) {
+                totalCounts[i] += subs[s].counts[i];
+            }
+        }
+    }
+    
+    // Copy UART hardware counts directly to our API ID array (1 to 7)
+    for (int i = 1; i <= 7; i++) {
+        connectedCount[i] = totalCounts[i - 1];
+    }
 }
 
-void pollProductionRanges() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+void updateDisplays() {
+    int32_t combinedBatteryPump = productionByTypeMW[8] + productionByTypeMW[6];
+    int32_t combinedWindSolar = productionByTypeMW[2] + productionByTypeMW[1];
 
-	HTTPClient http;
-	http.begin(String(API_BASE_URL) + "/prod_vals");
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	
-	int httpCode = http.GET();
-	
-	if (httpCode == 200) {
-		WiFiClient* stream = http.getStreamPtr();
-		if (stream->available() >= 1) {
-			uint8_t count = stream->read();
-			Serial.printf("\n=== [Production Ranges] ===\n");
-			for (int i = 0; i < count; i++) {
-				uint8_t source_id = stream->read();
-				int32_t min_power_scaled = readBE32(stream);
-				int32_t max_power_scaled = readBE32(stream);
-				
-				float min_power_mw = min_power_scaled / 1000.0;
-				float max_power_mw = max_power_scaled / 1000.0;
-				
-				Serial.printf("  -> Source ID: %d | Min: %.1f MW | Max: %.1f MW\n", source_id, min_power_mw, max_power_mw);
-			}
-			Serial.printf("===========================\n");
-		}
-	} else {
-		Serial.printf("[Net] GET /prod_vals failed. Code: %d\n", httpCode);
-	}
-	http.end();
+    // COAL (API ID 7)
+    if (currentCoefficient[7] > 0.0) coalDisplay.displayNumber(productionByTypeMW[7], 0);
+    else coalDisplay.clear(); 
+
+    // HYDRO (API ID 5)
+    if (currentCoefficient[5] > 0.0) hydroDisplay.displayNumber(productionByTypeMW[5], 0);
+    else hydroDisplay.clear();
+
+    // BATTERY (API ID 8) + PUMP (API ID 6)
+    if (currentCoefficient[8] > 0.0 || currentCoefficient[6] > 0.0) batteryDisplay.displayNumber(combinedBatteryPump, 0);
+    else batteryDisplay.clear();
+
+    // NUCLEAR (API ID 3)
+    if (currentCoefficient[3] > 0.0) nuclearDisplay.displayNumber(productionByTypeMW[3], 0);
+    else nuclearDisplay.clear();
+
+    // GAS (API ID 4)
+    if (currentCoefficient[4] > 0.0) gasDisplay.displayNumber(productionByTypeMW[4], 0);
+    else gasDisplay.clear();
+
+    // WIND (API ID 2) + SOLAR/PV (API ID 1)
+    if (currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0) windPvDisplay.displayNumber(combinedWindSolar, 0);
+    else windPvDisplay.clear();
+
+    if (consumptionDisp) consumptionDisp->displayNumber(currentTotalConsumption_mW / 1000, 0);
+    if (productionDisp) productionDisp->displayNumber(currentTotalProduction_mW / 1000, 0);
 }
 
-void pollConsumptionValues() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+void updateBargraphs() {
+    updateTotalCounts();
 
-	HTTPClient http;
-	http.begin(String(API_BASE_URL) + "/cons_vals");
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	
-	int httpCode = http.GET();
-	
-	if (httpCode == 200) {
-		WiFiClient* stream = http.getStreamPtr();
-		if (stream->available() >= 1) {
-			uint8_t count = stream->read();
-			Serial.printf("\n=== [Consumer Base Values] ===\n");
-			for (int i = 0; i < count; i++) {
-				uint8_t building_id = stream->read();
-				int32_t cons_scaled = readBE32(stream);
-				
-				float cons_mw = cons_scaled / 1000.0;
-				
-				Serial.printf("  -> Building ID: %d | Consumption: %.1f MW\n", building_id, cons_mw);
-			}
-			Serial.printf("==============================\n");
-		}
-	} else {
-		Serial.printf("[Net] GET /cons_vals failed. Code: %d\n", httpCode);
-	}
-	http.end();
-}
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+        if (!encoders[i] || !bargraphs[i]) continue;
+        
+        int32_t activeMin = 0;
+        int32_t activeMax = 0;
+        float displayCoeff = 0.0;
 
-void postConnectedConsumers() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+        // Calculate active bounds based on the mapping
+        switch(i) {
+            case 0: // COAL (ID 7)
+                activeMin = (int32_t)(baseMinMW[7] * connectedCount[7] * currentCoefficient[7]);
+                activeMax = (int32_t)(baseMaxMW[7] * connectedCount[7] * currentCoefficient[7]);
+                displayCoeff = currentCoefficient[7];
+                break;
+            case 1: // HYDRO (ID 5)
+                activeMin = (int32_t)(baseMinMW[5] * connectedCount[5] * currentCoefficient[5]);
+                activeMax = (int32_t)(baseMaxMW[5] * connectedCount[5] * currentCoefficient[5]);
+                displayCoeff = currentCoefficient[5];
+                break;
+            case 2: // BATTERY (ID 8) + PUMP (ID 6)
+                activeMin = (int32_t)(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) + 
+                            (int32_t)(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
+                activeMax = (int32_t)(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) + 
+                            (int32_t)(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
+                displayCoeff = max(currentCoefficient[8], currentCoefficient[6]); 
+                break;
+            case 3: // NUCLEAR (ID 3)
+                activeMin = (int32_t)(baseMinMW[3] * connectedCount[3] * currentCoefficient[3]);
+                activeMax = (int32_t)(baseMaxMW[3] * connectedCount[3] * currentCoefficient[3]);
+                displayCoeff = currentCoefficient[3];
+                break;
+            case 4: // GAS (ID 4)
+                activeMin = (int32_t)(baseMinMW[4] * connectedCount[4] * currentCoefficient[4]);
+                activeMax = (int32_t)(baseMaxMW[4] * connectedCount[4] * currentCoefficient[4]);
+                displayCoeff = currentCoefficient[4];
+                break;
+            case 5: // WIND (ID 2) + SOLAR/PV (ID 1)
+                activeMin = (int32_t)(baseMinMW[2] * connectedCount[2] * currentCoefficient[2]) + 
+                            (int32_t)(baseMinMW[1] * connectedCount[1] * currentCoefficient[1]);
+                activeMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]) + 
+                            (int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
+                displayCoeff = max(currentCoefficient[2], currentCoefficient[1]); 
+                break;
+        }
 
-	HTTPClient http;
-	http.begin(String(API_BASE_URL) + "/cons_connected");
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	http.addHeader("Content-Type", "application/octet-stream");
+        int32_t val = encoders[i]->get_value();
 
-	// TODO: Replace this empty vector with your actual list of active NFC UIDs later
-	std::vector<uint32_t> connected_consumer_ids; 
-	
-	// Format: count(1) + [id(4)] * count
-	size_t payload_len = 1 + (connected_consumer_ids.size() * 4);
-	uint8_t* payload = new uint8_t[payload_len];
-	
-	payload[0] = connected_consumer_ids.size();
-	
-	int offset = 1;
-	for (uint32_t id : connected_consumer_ids) {
-		// Pack as Big Endian
-		payload[offset++] = (id >> 24) & 0xFF;
-		payload[offset++] = (id >> 16) & 0xFF;
-		payload[offset++] = (id >> 8) & 0xFF;
-		payload[offset++] = id & 0xFF;
-	}
+        // Enforce Bounds and Draw
+        if (displayCoeff <= 0.0 || activeMax == 0) {
+            val = 0;
+            encoders[i]->set_value(0);
+            bargraphs[i]->setValue(0);
+        } else {
+            if (val < activeMin) {
+                val = activeMin;
+                encoders[i]->set_value(val);
+            } else if (val > activeMax) {
+                val = activeMax;
+                encoders[i]->set_value(val);
+            }
 
-	int httpCode = http.POST(payload, payload_len);
-	
-	if (httpCode != 200) {
-		Serial.printf("[Net] POST /cons_connected failed. Code: %d\n", httpCode);
-	}
-	
-	delete[] payload;
-	http.end();
-}
-
-void postTelemetry() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-
-	HTTPClient http;
-	http.begin(String(API_BASE_URL) + "/post_vals");
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	http.addHeader("Content-Type", "application/octet-stream");
-
-	// Format: production(4) + consumption(4) + buildings_count(1) = 9 bytes
-	uint8_t payload[9];
-	
-	// Pack Production (Big Endian)
-	payload[0] = (currentTotalProduction_MW >> 24) & 0xFF;
-	payload[1] = (currentTotalProduction_MW >> 16) & 0xFF;
-	payload[2] = (currentTotalProduction_MW >> 8) & 0xFF;
-	payload[3] = currentTotalProduction_MW & 0xFF;
-	
-	// Pack Consumption (Big Endian)
-	payload[4] = (currentTotalConsumption_MW >> 24) & 0xFF;
-	payload[5] = (currentTotalConsumption_MW >> 16) & 0xFF;
-	payload[6] = (currentTotalConsumption_MW >> 8) & 0xFF;
-	payload[7] = currentTotalConsumption_MW & 0xFF;
-	
-	// Pack Buildings Count (0 for now)
-	payload[8] = 0;
-
-	int httpCode = http.POST(payload, sizeof(payload));
-	
-	if (httpCode != 200) {
-		Serial.printf("[Net] Telemetry POST failed. Code: %d\n", httpCode);
-	}
-	
-	http.end();
-}
-
-void connectWiFi() {
-	if (WiFi.status() == WL_CONNECTED) return;
-	
-	Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
-	WiFi.begin(WIFI_SSID, WIFI_PASS);
-}
-
-bool authenticate() {
-	if (WiFi.status() != WL_CONNECTED) return false;
-
-	HTTPClient http;
-	String loginUrl = String(API_BASE_URL) + "/login";
-	http.begin(loginUrl);
-	http.addHeader("Content-Type", "application/json");
-
-	StaticJsonDocument<200> doc;
-	doc["username"] = BOARD_USERNAME;
-	doc["password"] = BOARD_PASSWORD;
-	
-	String requestBody;
-	serializeJson(doc, requestBody);
-
-	int httpCode = http.POST(requestBody);
-	bool success = false;
-
-	if (httpCode == 200) {
-		String payload = http.getString();
-		StaticJsonDocument<512> responseDoc;
-		DeserializationError error = deserializeJson(responseDoc, payload);
-		
-		if (!error && responseDoc.containsKey("token")) {
-			jwtToken = responseDoc["token"].as<String>();
-			Serial.println("[Net] Authentication successful. Token acquired.");
-			success = true;
-		}
-	} else {
-		Serial.printf("[Net] Auth failed. HTTP Code: %d\n", httpCode);
-	}
-
-	http.end();
-	return success;
-}
-
-bool registerBoard() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return false;
-
-	HTTPClient http;
-	String regUrl = String(API_BASE_URL) + "/register";
-	http.begin(regUrl);
-	http.addHeader("Authorization", "Bearer " + jwtToken);
-	
-	int httpCode = http.POST("");
-	bool success = false;
-
-	if (httpCode == 200) {
-		// According to binary_protocol.py, response is: success(1) + message_len(1) + message
-		WiFiClient* stream = http.getStreamPtr();
-		if (stream->available() >= 2) {
-			uint8_t status = stream->read();
-			uint8_t len = stream->read();
-			if (status == 1) {
-				Serial.println("[Net] Board binary registration successful.");
-				success = true;
-			}
-		}
-	} else {
-		Serial.printf("[Net] Registration failed. HTTP Code: %d\n", httpCode);
-		jwtToken = ""; // Force re-auth on next cycle
-	}
-	
-	http.end();
-	return success;
-}
-
-void networkTask() {
-	unsigned long now = millis();
-
-	// 1. Handle Connection & Auth
-	if (WiFi.status() != WL_CONNECTED) {
-		if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
-			lastNetworkRetry = now;
-			connectWiFi();
-		}
-		return;
-	}
-
-	if (jwtToken == "") {
-		if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
-			lastNetworkRetry = now;
-			if (authenticate()) {
-				registerBoard();
-			}
-		}
-		return; // Don't try to poll/post without a token
-	}
-
-	// 2. Poll Game State and Ranges from API (Every 2s)
-	if (now - lastPollMs >= POLL_INTERVAL) {
-		lastPollMs = now;
-		pollGameState();
-		pollProductionRanges();
-		pollConsumptionValues();
-	}
-
-	// 3. Post Hardware State to API (Every 1s)
-	if (now - lastPostMs >= POST_INTERVAL) {
-		lastPostMs = now;
-		postTelemetry();
-		postConnectedConsumers();
-	}
+            uint8_t bgVal = 0;
+            if (activeMax > activeMin) {
+                bgVal = static_cast<uint8_t>(map(val, activeMin, activeMax, 1, BARGRAPH_LED_COUNT));
+            } else {
+                bgVal = BARGRAPH_LED_COUNT; 
+            }
+            bargraphs[i]->setValue(bgVal);
+        }
+        
+        encoderValuesMW[i] = val;
+    }
 }
 
 void setup() {
-	Serial.begin(115200);
-	delay(100);
-	connectWiFi();
+    Serial.begin(115200);
+    delay(3000); 
+    
+    Serial.println("\n\n[Main] Booting ESP32-S3...");
+    networkSetup();
+
+    hardwareMutex = xSemaphoreCreateMutex();
+    statusLed = factory.createLed(STATUS_LED_PIN);
+
+    subs[0].init(&subSerial1, SUB1_RX_PIN, SUB1_TX_PIN);
+    subs[1].init(&subSerial2, SUB2_RX_PIN, SUB2_TX_PIN);
+    subs[2].init(&subSerial3, SUB3_RX_PIN, SUB3_TX_PIN);
+
+    outChain = factory.createShiftRegisterChain(OUT_LATCH_PIN, OUT_DATA_PIN, SHARED_CLOCK_PIN);
+    inChain = factory.createInputShiftRegisterChain(IN_LOAD_PIN, IN_DATA_PIN, SHARED_CLOCK_PIN, INPUT_REGISTER_COUNT);
+
+    encoders.reserve(DEVICE_COUNT);
+    buttons.reserve(DEVICE_COUNT);
+    bargraphs.reserve(DEVICE_COUNT);
+
+    const uint8_t encoderRegisterIndex[DEVICE_COUNT] = {0, 0, 1, 1, 2, 2};
+    const uint8_t encoderBitPosition[DEVICE_COUNT]   = {0, 3, 0, 3, 0, 3};
+    const uint8_t buttonRegisterIndex[DEVICE_COUNT]  = {0, 0, 1, 1, 2, 2};
+    const uint8_t buttonBitPosition[DEVICE_COUNT]    = {2, 5, 2, 5, 2, 5};
+
+    for (uint8_t i = 0; i < DEVICE_COUNT; ++i) {
+        encoders.push_back(factory.createShiftEncoder(inChain, encoderRegisterIndex[i], encoderBitPosition[i], -10000, 10000, -1));
+        buttons.push_back(factory.createShiftButton(inChain, buttonRegisterIndex[i], buttonBitPosition[i], true));
+    }
+
+    productionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
+    consumptionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
+
+    Bargraph* bg5 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    Bargraph* bg4 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    disp3 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
+    
+    Bargraph* bg3 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    Bargraph* bg2 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    disp2 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
+    
+    Bargraph* bg1 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    Bargraph* bg0 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
+    disp1 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
+
+    bargraphs.push_back(bg0);
+    bargraphs.push_back(bg1);
+    bargraphs.push_back(bg2);
+    bargraphs.push_back(bg3);
+    bargraphs.push_back(bg4);
+    bargraphs.push_back(bg5);
+
+    coalDisplay = disp1.left();
+    hydroDisplay = disp1.right();
+    batteryDisplay = disp2.left();
+    nuclearDisplay = disp2.right();
+    gasDisplay = disp3.left();
+    windPvDisplay = disp3.right();
+
+    factory.createPeriodic(50, []() {
+        updateBargraphs();
+        updateDisplays();
+    });
+
+    xTaskCreatePinnedToCore(peripheralTask, "PeripheralTask", 4096, NULL, 1, &PeripheralTaskHandle, 0);
 }
 
 void loop() {
-	networkTask();
-	delay(10);
+    networkTask();
+
+    xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+    uint32_t totalProdThisCycle = 0;
+    
+    // 1. Tally up the standard 1-to-1 physical encoders
+    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
+        // Skip the shared Battery/Pump encoder (Index 2)
+        // Skip the virtual Weather encoder (Index 5)
+        if (i == 2 || i == 5) continue; 
+        
+        uint8_t typeID = apiTypeMap[i];
+        productionByTypeMW[typeID] = encoderValuesMW[i];
+        totalProdThisCycle += encoderValuesMW[i];
+    }
+    
+    // 2. Distribute the shared encoder (Index 2) evenly (50/50)
+    int32_t sharedVal = encoderValuesMW[2];
+    
+    // Divide by 2. Subtracting the half prevents lost MWs on odd numbers.
+    productionByTypeMW[8] = sharedVal / 2; // Battery (ID 8)
+    productionByTypeMW[6] = sharedVal - productionByTypeMW[8]; // Pumped Hydro (ID 6)
+    
+    totalProdThisCycle += sharedVal; 
+    
+    // 3. Tally up the VIRTUAL plants (Weather Dependent, No physical encoder)
+    int32_t solarActiveMax = (int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
+    int32_t windActiveMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]);
+    
+    productionByTypeMW[1] = solarActiveMax; 
+    productionByTypeMW[2] = windActiveMax; 
+    
+    int32_t combinedWeatherPower = solarActiveMax + windActiveMax;
+    totalProdThisCycle += combinedWeatherPower;
+
+    // Feed the combined weather power into the "virtual" 6th encoder 
+    // so the bargraph automatically displays the weather output!
+    encoderValuesMW[5] = combinedWeatherPower;
+    if (encoders.size() > 5 && encoders[5]) {
+        encoders[5]->set_value(combinedWeatherPower);
+    }
+
+    xSemaphoreGive(hardwareMutex);
+
+    currentTotalProduction_mW = totalProdThisCycle * 1000;
+
+    const uint32_t now = millis();
+    if (now - lastLedToggleMs >= 500) {
+        lastLedToggleMs = now;
+        ledState = !ledState;
+        xSemaphoreTake(hardwareMutex, portMAX_DELAY);
+        if (statusLed) statusLed->setState(ledState);
+        xSemaphoreGive(hardwareMutex);
+    }
+    
+    delay(10);
 }

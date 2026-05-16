@@ -102,6 +102,10 @@ class PioMonitorThread(QThread):
 		self._stop_requested = True
 		if self.process and self.process.poll() is None:
 			self.process.terminate()
+			try:
+				self.process.wait(timeout=2)
+			except subprocess.TimeoutExpired:
+				self.process.kill()
 
 class PowerplantManager(QWidget):
 	def __init__(self):
@@ -300,6 +304,11 @@ class PowerplantManager(QWidget):
 				self.port_combo.setCurrentIndex(index)
 			else:
 				self.port_combo.setEditText(current_text)
+		elif self.port_combo.count() > 1:
+			for idx in range(1, self.port_combo.count()):
+				if self.port_combo.itemData(idx):
+					self.port_combo.setCurrentIndex(idx)
+					break
 
 	def get_selected_port(self):
 		data = self.port_combo.currentData()
@@ -348,6 +357,11 @@ class PowerplantManager(QWidget):
 		self.upload_btn.setEnabled(False)
 		self.output_text.clear()
 		selected_port = self.get_selected_port()
+
+		if self.monitor_thread and self.monitor_thread.isRunning():
+			self.log("--- Stopping serial monitor to free the port ---")
+			self.monitor_thread.stop()
+			self.monitor_thread.wait(3000)
 
 		if board_kind == "Powerplant":
 			selected_type = self.type_combo.currentText()
