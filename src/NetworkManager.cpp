@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <vector>
 #include "Config.h"
 #include "GameState.h"
 
@@ -181,6 +182,29 @@ void pollProductionRanges() {
     http.end();
 }
 
+void pollConsumptionValues() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+    
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/cons_vals");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    
+    if (http.GET() == 200) {
+        WiFiClient* stream = http.getStreamPtr();
+        if (stream->available() >= 1) {
+            uint8_t count = stream->read();
+            for (int i = 0; i < count; i++) {
+                uint8_t b_id = stream->read();
+                int32_t cons_mw = readBE32(stream);
+                if (b_id < 0x12) {
+                    buildingConsumptionMW[b_id] = cons_mw;
+                }
+            }
+        }
+    }
+    http.end();
+}
+
 void postTelemetry() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
     
@@ -189,22 +213,33 @@ void postTelemetry() {
     http.addHeader("Authorization", "Bearer " + jwtToken);
     http.addHeader("Content-Type", "application/octet-stream");
 
-    uint8_t payload[9];
-    payload[0] = (currentTotalProduction_mW >> 24) & 0xFF;
-    payload[1] = (currentTotalProduction_mW >> 16) & 0xFF;
-    payload[2] = (currentTotalProduction_mW >> 8) & 0xFF;
-    payload[3] = currentTotalProduction_mW & 0xFF;
-    payload[4] = (currentTotalConsumption_mW >> 24) & 0xFF;
-    payload[5] = (currentTotalConsumption_mW >> 16) & 0xFF;
-    payload[6] = (currentTotalConsumption_mW >> 8) & 0xFF;
-    payload[7] = currentTotalConsumption_mW & 0xFF;
-    payload[8] = 0;
+    std::vector<uint8_t> payload;
+    payload.reserve(32 + scannedBuildings.size() * 12);
 
-    http.POST(payload, sizeof(payload));
+    payload.push_back((currentTotalProduction_mW >> 24) & 0xFF);
+    payload.push_back((currentTotalProduction_mW >> 16) & 0xFF);
+    payload.push_back((currentTotalProduction_mW >> 8) & 0xFF);
+    payload.push_back(currentTotalProduction_mW & 0xFF);
+    
+    payload.push_back((currentTotalConsumption_mW >> 24) & 0xFF);
+    payload.push_back((currentTotalConsumption_mW >> 16) & 0xFF);
+    payload.push_back((currentTotalConsumption_mW >> 8) & 0xFF);
+    payload.push_back(currentTotalConsumption_mW & 0xFF);
+
+    // Append connected buildings count and structures
+    payload.push_back(scannedBuildings.size() & 0xFF);
+    for (const auto& b : scannedBuildings) {
+        payload.push_back(b.uid.length() & 0xFF);
+        for (size_t i = 0; i < b.uid.length(); i++) {
+            payload.push_back(b.uid[i]);
+        }
+        payload.push_back(b.type);
+    }
+
+    http.POST(payload.data(), payload.size());
     http.end();
 }
 
-// Background FreeRTOS Task for Network Operations
 void networkTaskImpl(void *pvParameters) {
     for (;;) {
         unsigned long now = millis();
@@ -234,6 +269,7 @@ void networkTaskImpl(void *pvParameters) {
             lastPollMs = now;
             pollGameState();
             pollProductionRanges();
+            pollConsumptionValues(); // Added consumption tracking poll
         }
 
         if (now - lastPostMs >= POST_INTERVAL) {
@@ -241,21 +277,11 @@ void networkTaskImpl(void *pvParameters) {
             postTelemetry();
         }
 
-        // Yield time back to the OS
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void startNetworkTask() {
-    // Pin to Core 0 (Protocol/Network Core) so Core 1 (App Core) handles hardware
-    xTaskCreatePinnedToCore(
-        networkTaskImpl,   // Task function
-        "NetworkTask",     // Task name
-        8192,              // Stack size
-        NULL,              // Parameters
-        1,                 // Priority
-        NULL,              // Task handle
-        0                  // Pin to Core 0
-    );
+    xTaskCreatePinnedToCore(networkTaskImpl, "NetworkTask", 8192, NULL, 1, NULL, 0);
     Serial.println("[Net] Network Task started on Core 0");
 }

@@ -57,10 +57,27 @@ void sendPendingSubstationCommands() {
                 if (sub.needsUpdate[i]) {
                     uint8_t type = hwTypeMap[i];
                     int32_t val = lastSentValues[i];
+                    float pct = encoderPercentages[i] * 100.0f;
+
+                    // Clamp percentage to prevent overflow
+                    if (pct < 0.0f) pct = 0.0f;
+                    if (pct > 100.0f) pct = 100.0f;
+
                     uint8_t r = 0, g = 0, b = 0;
-                    if (val < 20) { r = 255; g = 0; b = 0; }
-                    else if (val > 50) { r = 0; g = 255; b = 0; }
-                    else { r = 255; g = 255; b = 0; }
+
+                    // Smooth gradient: Red -> Yellow -> Green
+                    if (pct <= 50.0f) { 
+                        // 0% to 50%: Red is solid, Green fades in
+                        r = 255; 
+                        g = (uint8_t)((pct / 50.0f) * 255.0f); 
+                        b = 0;
+                    } else { 
+                        // 50% to 100%: Green is solid, Red fades out
+                        r = (uint8_t)(((100.0f - pct) / 50.0f) * 255.0f); 
+                        g = 255; 
+                        b = 0;
+                    }
+
                     char cmd[32];
                     snprintf(cmd, sizeof(cmd), "RGB %d %d %d %d", type, r, g, b);
                     sub.send(cmd);

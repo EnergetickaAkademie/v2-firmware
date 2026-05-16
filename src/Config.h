@@ -44,4 +44,8 @@
 #define DEVICE_COUNT 6
 #define INPUT_REGISTER_COUNT 3
 
+#define SDA_PIN 1 
+#define SCL_PIN 2
+#define BUZZER_PIN 6
+
 #endif
