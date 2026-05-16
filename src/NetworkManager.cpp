@@ -5,8 +5,6 @@
 #include "Config.h"
 #include "GameState.h"
 
-//#define DEBUG_PRINT_GAME_STATE
-
 unsigned long lastNetworkRetry = 0;
 const unsigned long NETWORK_RETRY_INTERVAL = 5000;
 
@@ -70,7 +68,6 @@ bool authenticate() {
     http.begin(String(API_BASE_URL) + "/login");
     http.addHeader("Content-Type", "application/json");
 
-    // ArduinoJson V7 syntax
     JsonDocument doc;
     doc["username"] = BOARD_USERNAME;
     doc["password"] = BOARD_PASSWORD;
@@ -136,14 +133,12 @@ void pollGameState() {
     if (http.GET() == 200) {
         WiFiClient* stream = http.getStreamPtr();
         if (stream->available() >= 1) {
-            Serial.println("\n=== [Game State Update] ===");
             uint8_t prod_count = stream->read();
             for (int i = 0; i < prod_count; i++) {
                 uint8_t source_id = stream->read();
                 int32_t coeff_mw = readBE32(stream);
                 float coeff = coeff_mw / 1000.0;
                 
-                // Directly save coefficient using the API ID!
                 if (source_id <= 8) currentCoefficient[source_id] = coeff;
             }
             if (stream->available() >= 1) {
@@ -153,9 +148,7 @@ void pollGameState() {
                     readBE32(stream); // cons_mw
                 }
             }
-            Serial.println("Game State Parsed Successfully.");
         } else {
-            Serial.println("[Game State] Server returned empty payload. Game paused/ended.");
             for(int j = 0; j <= 8; j++) currentCoefficient[j] = 0.0;
         }
     }
@@ -178,7 +171,6 @@ void pollProductionRanges() {
                 int32_t min_power_mw = readBE32(stream) / 1000;
                 int32_t max_power_mw = readBE32(stream) / 1000;
                 
-                // Directly save bounds using the API ID!
                 if (source_id <= 8) {
                     baseMinMW[source_id] = min_power_mw;
                     baseMaxMW[source_id] = max_power_mw;
@@ -206,42 +198,64 @@ void postTelemetry() {
     payload[5] = (currentTotalConsumption_mW >> 16) & 0xFF;
     payload[6] = (currentTotalConsumption_mW >> 8) & 0xFF;
     payload[7] = currentTotalConsumption_mW & 0xFF;
-    payload[8] = 0; // Buildings count (0 for now)
+    payload[8] = 0;
 
     http.POST(payload, sizeof(payload));
     http.end();
 }
 
-void networkTask() {
-    unsigned long now = millis();
-    
-    if (WiFi.status() != WL_CONNECTED) {
-        if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
-            lastNetworkRetry = now;
-            connectWiFi();
-        }
-        return;
-    }
-
-    if (jwtToken == "") {
-        if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
-            lastNetworkRetry = now; 
-            Serial.println("[Net] Attempting API Authentication...");
-            if (authenticate()) {
-                registerBoard();
+// Background FreeRTOS Task for Network Operations
+void networkTaskImpl(void *pvParameters) {
+    for (;;) {
+        unsigned long now = millis();
+        
+        if (WiFi.status() != WL_CONNECTED) {
+            if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
+                lastNetworkRetry = now;
+                connectWiFi();
             }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        return; 
-    }
 
-    if (now - lastPollMs >= POLL_INTERVAL) {
-        lastPollMs = now;
-        pollGameState();
-        pollProductionRanges();
-    }
+        if (jwtToken == "") {
+            if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
+                lastNetworkRetry = now; 
+                Serial.println("[Net] Attempting API Authentication...");
+                if (authenticate()) {
+                    registerBoard();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue; 
+        }
 
-    if (now - lastPostMs >= POST_INTERVAL) {
-        lastPostMs = now;
-        postTelemetry();
+        if (now - lastPollMs >= POLL_INTERVAL) {
+            lastPollMs = now;
+            pollGameState();
+            pollProductionRanges();
+        }
+
+        if (now - lastPostMs >= POST_INTERVAL) {
+            lastPostMs = now;
+            postTelemetry();
+        }
+
+        // Yield time back to the OS
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+void startNetworkTask() {
+    // Pin to Core 0 (Protocol/Network Core) so Core 1 (App Core) handles hardware
+    xTaskCreatePinnedToCore(
+        networkTaskImpl,   // Task function
+        "NetworkTask",     // Task name
+        8192,              // Stack size
+        NULL,              // Parameters
+        1,                 // Priority
+        NULL,              // Task handle
+        0                  // Pin to Core 0
+    );
+    Serial.println("[Net] Network Task started on Core 0");
 }

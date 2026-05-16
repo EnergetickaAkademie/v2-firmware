@@ -2,6 +2,6 @@
 #define NETWORKMANAGER_H
 
 void networkSetup();
-void networkTask();
+void startNetworkTask();
 
 #endif
