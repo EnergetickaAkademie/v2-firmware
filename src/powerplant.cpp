@@ -66,7 +66,7 @@ void setup() {
     // Initialize RGB hardware via the Peripheral Factory
     myRGB = factory.createSimpleRGB(RGB_PIN);
     if (myRGB != nullptr) {
-        myRGB->setColor(0, 0, 0); // Turn off initially
+        myRGB->setColor(5, 0, 5); // Turn off initially
     }
     
     // BitBus Initialization

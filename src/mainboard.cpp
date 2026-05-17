@@ -106,7 +106,7 @@ bool updateBargraphs() {
         }
 
         int32_t val = encoders[i]->get_value();
-        float pct = 0.0f; // Track percentage for the substation
+        float pct = 0.0f; 
 
         if (displayCoeff <= 0.0 || activeMax == 0) {
             val = 0;
@@ -126,8 +126,12 @@ bool updateBargraphs() {
                 anyChanged = true;
             }
 
-            // Calculate the percentage based on the clamped value
-            pct = (float)val / (float)activeMax;
+            // [FIXED] Calculate the percentage based on the true span between activeMin and activeMax
+            if (activeMax > activeMin) {
+                pct = (float)(val - activeMin) / (float)(activeMax - activeMin);
+            } else {
+                pct = 1.0f; // Default if min and max are somehow identical
+            }
 
             uint8_t bgVal = 0;
             if (activeMax > activeMin) {
@@ -138,7 +142,7 @@ bool updateBargraphs() {
             bargraphs[i]->setValue(bgVal);
         }
         
-        // Export the percentage for the SubstationManager
+        // Export the corrected percentage for the SubstationManager
         encoderPercentages[i] = pct;
 
         if (encoderValuesMW[i] != val) {

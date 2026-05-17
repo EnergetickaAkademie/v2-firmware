@@ -16,7 +16,7 @@ struct Substation {
     bool online;
     uint8_t counts[7];
     bool needsUpdate[DEVICE_COUNT];
-	uint8_t pendingCommandIndex;
+    uint8_t pendingCommandIndex;
     uint32_t lastCommandSendMs;
     
     void init(HardwareSerial* p, int rx, int tx) {
@@ -28,8 +28,8 @@ struct Substation {
         memset(counts, 0, sizeof(counts));
         for(int i=0; i<DEVICE_COUNT; i++) needsUpdate[i] = true;
 
-		pendingCommandIndex = 0;
-		lastCommandSendMs = 0;
+        pendingCommandIndex = 0;
+        lastCommandSendMs = 0;
     }
 
     void send(const char* cmd) {
@@ -51,41 +51,66 @@ void sendPendingSubstationCommands() {
         Substation& sub = subs[s];
         if (!sub.online) continue;
 
-        if (sub.pendingCommandIndex < DEVICE_COUNT) {
-            if (millis() - sub.lastCommandSendMs >= 20) {
-                int i = sub.pendingCommandIndex++;
-                if (sub.needsUpdate[i]) {
-                    uint8_t type = hwTypeMap[i];
-                    int32_t val = lastSentValues[i];
-                    float pct = encoderPercentages[i] * 100.0f;
+        bool needsBulk = false;
+        for (int i = 0; i < DEVICE_COUNT; i++) {
+            if (sub.needsUpdate[i]) needsBulk = true;
+        }
 
-                    // Clamp percentage to prevent overflow
-                    if (pct < 0.0f) pct = 0.0f;
-                    if (pct > 100.0f) pct = 100.0f;
+        if (needsBulk && (millis() - sub.lastCommandSendMs >= 150)) {
+            // Map encoder percentages to powerplant types 1-8
+            int pctMap[8] = {
+                (int)(encoderPercentages[5] * 100.0f), // Type 1 (Solar)
+                (int)(encoderPercentages[5] * 100.0f), // Type 2 (Wind)
+                (int)(encoderPercentages[3] * 100.0f), // Type 3 (Nuclear)
+                (int)(encoderPercentages[4] * 100.0f), // Type 4 (Gas)
+                (int)(encoderPercentages[1] * 100.0f), // Type 5 (Hydro)
+                (int)(encoderPercentages[2] * 100.0f), // Type 6 (PumpStor)
+                (int)(encoderPercentages[0] * 100.0f), // Type 7 (Coal)
+                (int)(encoderPercentages[2] * 100.0f)  // Type 8 (Battery)
+            };
 
-                    uint8_t r = 0, g = 0, b = 0;
+            String rgbCmd = "ALLRGB";
+            String motCmd = "ALLMOT";
 
-                    // Smooth gradient: Red -> Yellow -> Green
-                    if (pct <= 50.0f) { 
-                        // 0% to 50%: Red is solid, Green fades in
-                        r = 255; 
-                        g = (uint8_t)((pct / 50.0f) * 255.0f); 
-                        b = 0;
-                    } else { 
-                        // 50% to 100%: Green is solid, Red fades out
-                        r = (uint8_t)(((100.0f - pct) / 50.0f) * 255.0f); 
-                        g = 255; 
-                        b = 0;
-                    }
+            for (int i = 0; i < 8; i++) {
+                int pct = pctMap[i];
+                pct = constrain(pct, 0, 100);
 
-                    char cmd[32];
-                    snprintf(cmd, sizeof(cmd), "RGB %d %d %d %d", type, r, g, b);
-                    sub.send(cmd);
-                    snprintf(cmd, sizeof(cmd), "MOTOR %d %d", type, val > 0 ? 1 : 0);
-                    sub.send(cmd);
+                uint8_t r = 0, g = 0, b = 0;
+                
+                // 3-Phase Pronounced Gradient
+                if (pct <= 33) {
+                    // 0% to 33%: Dark Red fading up to Bright Red
+                    r = map(pct, 0, 33, 30, 255); // Starts at 30 (very dim red)
+                    g = 0;
+                    b = 0;
+                } else if (pct <= 66) {
+                    // 34% to 66%: Bright Red fading into Orange and then Yellow
+                    r = 255;
+                    g = map(pct, 34, 66, 0, 255);
+                    b = 0;
+                } else {
+                    // 67% to 100%: Yellow fading into Bright Green
+                    r = map(pct, 67, 100, 255, 0);
+                    g = 255;
+                    b = 0;
                 }
-                sub.lastCommandSendMs = millis();
+
+                char buf[16];
+                snprintf(buf, sizeof(buf), " %d %d %d", r, g, b);
+                rgbCmd += buf;
+
+                snprintf(buf, sizeof(buf), " %d", (pct > 0 ? 1 : 0));
+                motCmd += buf;
             }
+
+            sub.send(rgbCmd.c_str());
+            sub.send(motCmd.c_str());
+
+            for (int i = 0; i < DEVICE_COUNT; i++) {
+                sub.needsUpdate[i] = false;
+            }
+            sub.lastCommandSendMs = millis();
         }
     }
 }
@@ -99,15 +124,14 @@ void processSubstationLine(int subIndex, String line) {
     Substation& sub = subs[subIndex];
 
     if (line == "STATION_ON") {
-		sub.lastAlive = millis();
-		sub.online = true;
-        // The master no longer needs to ask for COUNTS?, the substation pushes it proactively.
+        sub.lastAlive = millis();
+        sub.online = true;
         
-		for (int i = 0; i < DEVICE_COUNT; i++) {
-			sub.needsUpdate[i] = true;
-		}
+        for (int i = 0; i < DEVICE_COUNT; i++) {
+            sub.needsUpdate[i] = true;
+        }
         sub.pendingCommandIndex = 0;
-	}
+    }
     else if (line.startsWith("COUNTS ")) {
         int counts[7];
         if (sscanf(line.c_str(), "COUNTS %d %d %d %d %d %d %d",
@@ -146,6 +170,14 @@ void pollSubstations() {
 }
 
 void queueSubstationUpdates() {
+    static uint32_t lastUpdateCheckMs = 0;
+    
+    // Only check for encoder changes every 500ms (adjust this value to your liking)
+    if (millis() - lastUpdateCheckMs < 500) {
+        return; 
+    }
+    lastUpdateCheckMs = millis();
+
     for (size_t i = 0; i < DEVICE_COUNT; ++i) {
         int32_t val = encoderValuesMW[i];
         if (val != lastSentValues[i]) {
@@ -159,22 +191,21 @@ void queueSubstationUpdates() {
 }
 
 void updateTotalCounts() {
-	memset(totalCounts, 0, sizeof(totalCounts));
-	int onlineSubstations = 0;
+    memset(totalCounts, 0, sizeof(totalCounts));
+    int onlineSubstations = 0;
 
-	for (int s = 0; s < 3; s++) {
-        // Increased timeout to 4000ms to tolerate Wi-Fi/HTTP blocking jitter
-		if (millis() - subs[s].lastAlive > 4000) {
-			subs[s].online = false;
-			memset(subs[s].counts, 0, sizeof(subs[s].counts));
-		}
-		if (subs[s].online) {
-			onlineSubstations++;
-			for (int i = 0; i < 7; i++) {
-				totalCounts[i] += subs[s].counts[i];
-			}
-		}
-	}
+    for (int s = 0; s < 3; s++) {
+        if (millis() - subs[s].lastAlive > 4000) {
+            subs[s].online = false;
+            memset(subs[s].counts, 0, sizeof(subs[s].counts));
+        }
+        if (subs[s].online) {
+            onlineSubstations++;
+            for (int i = 0; i < 7; i++) {
+                totalCounts[i] += subs[s].counts[i];
+            }
+        }
+    }
     
     bool countsChanged = false;
     static int lastOnlineSubstations = -1;
