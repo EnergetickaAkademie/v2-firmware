@@ -5,8 +5,8 @@
 #include <vector>
 
 extern String jwtToken;
-extern uint32_t currentTotalProduction_mW;
-extern uint32_t currentTotalConsumption_mW;
+extern int32_t currentTotalProduction_MW;
+extern int32_t currentTotalConsumption_MW;
 
 extern int32_t encoderValuesMW[6];
 extern float encoderPercentages[6];

@@ -216,15 +216,15 @@ void postTelemetry() {
     std::vector<uint8_t> payload;
     payload.reserve(32 + scannedBuildings.size() * 12);
 
-    payload.push_back((currentTotalProduction_mW >> 24) & 0xFF);
-    payload.push_back((currentTotalProduction_mW >> 16) & 0xFF);
-    payload.push_back((currentTotalProduction_mW >> 8) & 0xFF);
-    payload.push_back(currentTotalProduction_mW & 0xFF);
+    payload.push_back((currentTotalProduction_MW >> 24) & 0xFF);
+    payload.push_back((currentTotalProduction_MW >> 16) & 0xFF);
+    payload.push_back((currentTotalProduction_MW >> 8) & 0xFF);
+    payload.push_back(currentTotalProduction_MW & 0xFF);
     
-    payload.push_back((currentTotalConsumption_mW >> 24) & 0xFF);
-    payload.push_back((currentTotalConsumption_mW >> 16) & 0xFF);
-    payload.push_back((currentTotalConsumption_mW >> 8) & 0xFF);
-    payload.push_back(currentTotalConsumption_mW & 0xFF);
+    payload.push_back((currentTotalConsumption_MW >> 24) & 0xFF);
+    payload.push_back((currentTotalConsumption_MW >> 16) & 0xFF);
+    payload.push_back((currentTotalConsumption_MW >> 8) & 0xFF);
+    payload.push_back(currentTotalConsumption_MW & 0xFF);
 
     // Append connected buildings count and structures
     payload.push_back(scannedBuildings.size() & 0xFF);
