@@ -3,6 +3,8 @@
 
 #include <Arduino.h>
 #include <vector>
+#include "BuildingTypes.h"
+
 
 extern String jwtToken;
 extern int32_t currentTotalProduction_MW;
@@ -19,14 +21,21 @@ extern int32_t productionByTypeMW[9];
 
 extern const uint8_t apiTypeMap[6];
 
-// New consumption tracking variables
-extern uint32_t buildingConsumptionMW[0x12];
-extern uint8_t buildingCounts[0x12];
+extern uint32_t buildingConsumptionMW[BUILDING_COUNT];
 
 struct ScannedBuilding {
-    String uid;
-    uint8_t type;
+	String uid;
+	uint8_t type;
 };
 extern std::vector<ScannedBuilding> scannedBuildings;
+
+extern uint8_t authoritativeBuildingCounts[BUILDING_COUNT];
+
+struct PendingBuilding {
+	String uid;
+	uint8_t type;
+};
+extern std::vector<PendingBuilding> pendingBuildings;
+extern SemaphoreHandle_t pendingMutex;
 
 #endif

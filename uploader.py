@@ -39,7 +39,7 @@ class PioUploadThread(QThread):
 		self.log_signal.emit(f"--- Starting build with flags: {self.build_flags} ---")
 
 		try:
-			command = ["pio", "run", "-e", self.env_name, "-t", "upload"]
+			command = ["pio", "run", "-e", self.env_name, "-t", "clean", "-t", "upload"]
 			if self.port:
 				command.extend(["--upload-port", self.port])
 			process = subprocess.Popen(

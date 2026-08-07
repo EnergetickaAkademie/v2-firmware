@@ -251,6 +251,7 @@ void updateTotalCounts() {
             connectedCount[3], connectedCount[4], connectedCount[5], 
             connectedCount[6], connectedCount[7]
         );
-        Serial.print(outBuffer);
+
+        //Serial.print(outBuffer);
     }
 }

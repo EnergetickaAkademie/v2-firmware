@@ -38,9 +38,12 @@ void networkSetup() {
     WiFi.disconnect(true, true);
     delay(1000);
     
+    Serial.println("[Net] Setting WiFi OFF mode");
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+
     Serial.println("[Net] Setting Station Mode...");
     WiFi.mode(WIFI_STA);
-    delay(100);
     
     Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -197,11 +200,11 @@ void pollConsumptionValues() {
                 uint8_t b_id = stream->read();
                 int32_t cons_mw = readBE32(stream);
                 if (b_id < 0x12) {
-                    buildingConsumptionMW[b_id] = cons_mw;
+                    buildingConsumptionMW[b_id] = cons_mw / 1000;
                 }
             }
         }
-    }
+    }    
     http.end();
 }
 
@@ -214,27 +217,19 @@ void postTelemetry() {
     http.addHeader("Content-Type", "application/octet-stream");
 
     std::vector<uint8_t> payload;
-    payload.reserve(32 + scannedBuildings.size() * 12);
+    payload.reserve(8); // Only two 4-byte ints
 
+    // Pack production (4 bytes, big-endian)
     payload.push_back((currentTotalProduction_MW >> 24) & 0xFF);
     payload.push_back((currentTotalProduction_MW >> 16) & 0xFF);
     payload.push_back((currentTotalProduction_MW >> 8) & 0xFF);
     payload.push_back(currentTotalProduction_MW & 0xFF);
     
+    // Pack consumption (4 bytes, big-endian)
     payload.push_back((currentTotalConsumption_MW >> 24) & 0xFF);
     payload.push_back((currentTotalConsumption_MW >> 16) & 0xFF);
     payload.push_back((currentTotalConsumption_MW >> 8) & 0xFF);
     payload.push_back(currentTotalConsumption_MW & 0xFF);
-
-    // Append connected buildings count and structures
-    payload.push_back(scannedBuildings.size() & 0xFF);
-    for (const auto& b : scannedBuildings) {
-        payload.push_back(b.uid.length() & 0xFF);
-        for (size_t i = 0; i < b.uid.length(); i++) {
-            payload.push_back(b.uid[i]);
-        }
-        payload.push_back(b.type);
-    }
 
     http.POST(payload.data(), payload.size());
     http.end();
@@ -269,7 +264,8 @@ void networkTaskImpl(void *pvParameters) {
             lastPollMs = now;
             pollGameState();
             pollProductionRanges();
-            pollConsumptionValues(); // Added consumption tracking poll
+            pollConsumptionValues();
+            pollBuildingCounts();
         }
 
         if (now - lastPostMs >= POST_INTERVAL) {
@@ -284,4 +280,54 @@ void networkTaskImpl(void *pvParameters) {
 void startNetworkTask() {
     xTaskCreatePinnedToCore(networkTaskImpl, "NetworkTask", 8192, NULL, 1, NULL, 0);
     Serial.println("[Net] Network Task started on Core 0");
+}
+
+void sendAddBuilding(uint8_t type, const String& uid) {
+    /*Serial.printf("[Net] sendAddBuilding called: type=%d, uid=%s\n", type, uid.c_str());
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) {
+        Serial.println("[Net] sendAddBuilding: no token or WiFi");
+        return;
+    }*/
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/board/add_building");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    http.addHeader("Content-Type", "application/octet-stream");
+
+    std::vector<uint8_t> payload;
+    payload.reserve(2 + uid.length());
+    payload.push_back(type);
+    payload.push_back(uid.length());
+    for (size_t i = 0; i < uid.length(); i++) {
+        payload.push_back(uid[i]);
+    }
+
+    int code = http.POST(payload.data(), payload.size());
+    Serial.printf("[Net] sendAddBuilding HTTP code: %d\n", code);
+
+    http.end();
+}
+
+void pollBuildingCounts() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/board/get_counts");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    int code = http.GET();
+    if (code == 200) {
+        WiFiClient* stream = http.getStreamPtr();
+        if (stream->available() >= BUILDING_COUNT) {
+            for (int i = 0; i < BUILDING_COUNT; i++) {
+                authoritativeBuildingCounts[i] = stream->read();
+            }
+            
+            /*Serial.printf("[Net] Counts: ");
+            for (int i = 0; i < BUILDING_COUNT; i++) {
+                Serial.printf("%d ", authoritativeBuildingCounts[i]);
+            }
+            Serial.println();
+            */
+        }
+    }
+    http.end();
 }

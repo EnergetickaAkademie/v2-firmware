@@ -5,9 +5,11 @@
 #include "NetworkManager.h"
 #include "SubstationManager.h"
 #include "PeripheralFactory.h"
+#include "BuildingTypes.h"
+#include <algorithm>
 #include <PN532_I2C.h>
 #include <PN532.h>
-#include <algorithm>
+#include <WiFi.h>
 
 PeripheralFactory factory;
 ShiftRegisterChain* outChain = nullptr;
@@ -54,8 +56,8 @@ void updateDisplays() {
 	if (currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0) windPvDisplay.displayNumber(combinedWindSolar, 0);
 	else windPvDisplay.clear();
 
-	if (consumptionDisp) consumptionDisp->displayNumber(currentTotalConsumption_MW / 1000, 0);
-	if (productionDisp) productionDisp->displayNumber(currentTotalProduction_MW / 1000, 0);
+	if (consumptionDisp) consumptionDisp->displayNumber(currentTotalConsumption_MW, 0);
+	if (productionDisp) productionDisp->displayNumber(currentTotalProduction_MW, 0);
 }
 
 bool updateBargraphs() {
@@ -148,12 +150,30 @@ bool updateBargraphs() {
 	return anyChanged;
 }
 
+void processPendingBuildings() {
+	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+	if (pendingMutex == nullptr) return;
+
+	if (xSemaphoreTake(pendingMutex, 0) == pdTRUE) {
+		if (!pendingBuildings.empty()) {
+			PendingBuilding pb = pendingBuildings.front();
+			pendingBuildings.erase(pendingBuildings.begin());
+			xSemaphoreGive(pendingMutex);
+			sendAddBuilding(pb.type, pb.uid);   // HTTP now outside I2C context
+		} else {
+			xSemaphoreGive(pendingMutex);
+		}
+	}
+}
+
 void nfcTaskImpl(void *pvParameters) {
 	for (;;) {
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
 		uint8_t uidLength;
 
 		if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
+			Serial.println("[NFC] Tag detected!");
+
 			String uidStr = "";
 			for (uint8_t i = 0; i < uidLength; i++) {
 				uidStr += String(uid[i], HEX);
@@ -166,69 +186,85 @@ void nfcTaskImpl(void *pvParameters) {
 					break;
 				}
 			}
+			if (alreadyScanned) {
+				Serial.println("[NFC] Already scanned, ignoring.");
+				continue;
+			}
 
-			if (!alreadyScanned) {
-				uint8_t data[16] = {0}; 
-				bool readSuccess = false;
+			uint8_t data[32] = {0};
+			bool readSuccess = false;
 
-				if (uidLength == 7) {
-					if (nfc.mifareultralight_ReadPage(4, data)) {
-						readSuccess = true;
-					}
-				} else if (uidLength == 4) {
-					uint8_t keyNDEF[6]      = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
-					uint8_t keyUniversal[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-
-					if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNDEF)) {
-						if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
-					} 
-					else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
-						if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
-					}
+			if (uidLength == 7) {
+				if (nfc.mifareultralight_ReadPage(4, data) && nfc.mifareultralight_ReadPage(8, data + 16)) {
+					readSuccess = true;
 				}
+			} else if (uidLength == 4) {
+				uint8_t keyNDEF[6]      = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
+				uint8_t keyUniversal[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
-				if (readSuccess) {
-					bool formatFound = false;
-					uint8_t buildingType = 0;
-
-					for (int i = 0; i <= 16 - 5; i++) {
-						if (data[i] == 0xD1 && data[i+1] == 0x01 && data[i+2] == 0x01 && data[i+3] == 0x42) {
-							buildingType = data[i+4];
-							formatFound = true;
-							break;
-						}
-					}
-
-					if (formatFound) {
-						if (buildingType <= 0x11) {
-							scannedBuildings.push_back({uidStr, buildingType});
-							buildingCounts[buildingType]++;
-							
-							Serial.printf("[NFC] SUCCESS! UID: %s | Type: 0x%02X | Total: %d\n", 
-								uidStr.c_str(), buildingType, buildingCounts[buildingType]);
-							
-							tone(BUZZER_PIN, 2000, 150); 
-						} else {
-							Serial.printf("[NFC] REJECTED. Type out of bounds: 0x%02X\n", buildingType);
-							tone(BUZZER_PIN, 300, 300); 
-						}
-					} else {
-						Serial.println("[NFC] REJECTED. Valid NDEF format not found in memory.");
-						tone(BUZZER_PIN, 300, 300); 
-					}
-				} else {
-					Serial.printf("[NFC] REJECTED. Failed to read memory. UID length: %d\n", uidLength);
-					tone(BUZZER_PIN, 100, 500); 
+				if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNDEF)) {
+					if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
+				}
+				else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
+					if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
 				}
 			}
+
+			if (readSuccess) {
+				// --- DIAGNOSTIC DUMP ---
+				Serial.print("[NFC] Read 32 bytes: ");
+				for(int d = 0; d < 32; d++) {
+					Serial.printf("%02X ", data[d]);
+				}
+				Serial.println();
+				// -----------------------
+
+				bool formatFound = false;
+				uint8_t buildingType = 0;
+
+				for (int i = 0; i <= 32 - 4; i++) {
+					// Check Standard: [Type Len=1] [Payload Len=1] [Type='B'] [Payload]
+					if (data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x42) {
+						buildingType = data[i+3];
+						formatFound = true;
+						break;
+					}
+					// Check with ID Length inserted by Android: [Type Len=1] [Payload Len=1] [ID Len=0] [Type='B'] [Payload]
+					else if (i <= 32 - 5 && data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x00 && data[i+3] == 0x42) {
+						buildingType = data[i+4];
+						formatFound = true;
+						break;
+					}
+				}
+
+				if (formatFound && buildingType <= 0x11) {
+					scannedBuildings.push_back({uidStr, buildingType});
+
+					if (pendingMutex != nullptr && xSemaphoreTake(pendingMutex, portMAX_DELAY) == pdTRUE) {
+						pendingBuildings.push_back({uidStr, buildingType});
+						xSemaphoreGive(pendingMutex);
+						Serial.println("[NFC] Queued building for server.");
+					}
+
+					Serial.printf("[NFC] SUCCESS! UID: %s | Type: 0x%02X | Queued for server.\n",
+								  uidStr.c_str(), buildingType);
+					tone(BUZZER_PIN, 2000, 150);
+				} else {
+					Serial.println("[NFC] REJECTED. Valid NDEF format not found in memory.");
+					tone(BUZZER_PIN, 300, 300);
+				}
+			} else {
+				Serial.printf("[NFC] REJECTED. Failed to read memory. UID length: %d\n", uidLength);
+				tone(BUZZER_PIN, 100, 500);
+			}
 		}
-		
+
 		vTaskDelay(pdMS_TO_TICKS(150));
 	}
 }
 
 void startNfcTask() {
-	xTaskCreatePinnedToCore(nfcTaskImpl, "NFCTask", 4096, NULL, 1, NULL, 0);
+	xTaskCreatePinnedToCore(nfcTaskImpl, "NFCTask", 8192, NULL, 1, NULL, 0);
 }
 
 void setup() {
@@ -243,6 +279,8 @@ void setup() {
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(100000);
 	
+	pendingMutex = xSemaphoreCreateMutex();
+
 	nfc.begin();
 	uint32_t versiondata = nfc.getFirmwareVersion();
 	if (!versiondata) {
@@ -363,13 +401,21 @@ void loop() {
 		encoders[5]->set_value(combinedWeatherPower);
 	}
 	
-	currentTotalProduction_MW = totalProdThisCycle * 1000;
+	currentTotalProduction_MW = totalProdThisCycle;
 
 	uint32_t totalConsThisCycle = 0;
-	for (int i = 0; i < 0x12; i++) {
-		totalConsThisCycle += buildingCounts[i] * buildingConsumptionMW[i];
+	for (int i = 0; i < BUILDING_COUNT; i++) {
+		totalConsThisCycle += authoritativeBuildingCounts[i] * buildingConsumptionMW[i];
 	}
 	currentTotalConsumption_MW = totalConsThisCycle;
+
+	//Serial.printf("[Main] Consumption: totalConsThisCycle=%u, currentTotalConsumption_MW=%u\n", totalConsThisCycle, currentTotalConsumption_MW);
+
+	static uint32_t lastPendingProcess = 0;
+	if (now - lastPendingProcess >= 100) {
+		lastPendingProcess = now;
+		processPendingBuildings();
+	}
 
 	if (now - lastLedToggleMs >= 500) {
 		lastLedToggleMs = now;
