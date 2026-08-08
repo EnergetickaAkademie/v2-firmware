@@ -14,18 +14,112 @@ const unsigned long POLL_INTERVAL = 2000;
 unsigned long lastPostMs = 0;
 const unsigned long POST_INTERVAL = 1000;
 
-uint32_t swap_uint32(uint32_t val) {
-    return (val << 24) | ((val << 8) & 0x00FF0000) |
-           ((val >> 8) & 0x0000FF00) | (val >> 24);
+namespace {
+constexpr uint32_t STREAM_READ_TIMEOUT_MS = 3000;
+
+bool readExact(WiFiClient* stream, uint8_t* buffer, size_t length) {
+    if (!stream || !buffer) return false;
+    stream->setTimeout(STREAM_READ_TIMEOUT_MS);
+    size_t read = stream->readBytes(reinterpret_cast<char*>(buffer), length);
+    if (read != length) {
+        Serial.printf("[Net] Short HTTP body: expected %u bytes, got %u\n",
+                      static_cast<unsigned>(length),
+                      static_cast<unsigned>(read));
+        return false;
+    }
+    return true;
 }
 
-int32_t readBE32(WiFiClient* stream) {
-    uint8_t buf[4];
-    if (stream->readBytes(buf, 4) == 4) {
-        return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
-    }
-    return 0;
+bool readByte(WiFiClient* stream, uint8_t& value) {
+    return readExact(stream, &value, 1);
 }
+
+bool readBE32(WiFiClient* stream, int32_t& value) {
+    uint8_t buf[4];
+    if (!readExact(stream, buf, sizeof(buf))) return false;
+
+    uint32_t raw =
+        (static_cast<uint32_t>(buf[0]) << 24) |
+        (static_cast<uint32_t>(buf[1]) << 16) |
+        (static_cast<uint32_t>(buf[2]) << 8) |
+        static_cast<uint32_t>(buf[3]);
+    value = static_cast<int32_t>(raw);
+    return true;
+}
+
+bool handleAuthFailure(int httpCode, const char* endpoint) {
+    if (httpCode == 401 || httpCode == 403) {
+        Serial.printf("[Net] %s rejected token (HTTP %d); re-authentication required.\n",
+                      endpoint, httpCode);
+        jwtToken = "";
+        return true;
+    }
+    return false;
+}
+
+void logHttpFailure(const char* endpoint, int httpCode) {
+    if (httpCode < 0) {
+        Serial.printf("[Net] %s failed: %s (%d)\n",
+                      endpoint,
+                      HTTPClient::errorToString(httpCode).c_str(),
+                      httpCode);
+    } else {
+        Serial.printf("[Net] %s failed: HTTP %d\n", endpoint, httpCode);
+    }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.printf("[WiFi] Connected. IP=%s RSSI=%d dBm\n",
+                          WiFi.localIP().toString().c_str(),
+                          WiFi.RSSI());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            Serial.printf("[WiFi] Disconnected. reason=%d\n",
+                          info.wifi_sta_disconnected.reason);
+            break;
+        default:
+            break;
+    }
+}
+
+void processPendingBuildingUpload(uint32_t now) {
+    static uint32_t lastAttemptMs = 0;
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED || pendingMutex == nullptr) return;
+    if (now - lastAttemptMs < 2000) return;
+
+    PendingBuilding pending;
+    bool hasPending = false;
+
+    if (xSemaphoreTake(pendingMutex, 0) == pdTRUE) {
+        if (!pendingBuildings.empty()) {
+            pending = pendingBuildings.front();
+            hasPending = true;
+        }
+        xSemaphoreGive(pendingMutex);
+    }
+
+    if (!hasPending) return;
+
+    lastAttemptMs = now;
+    if (!sendAddBuilding(pending.type, pending.uid)) {
+        Serial.println("[Net] Building upload failed; keeping it queued for retry.");
+        return;
+    }
+
+    if (xSemaphoreTake(pendingMutex, portMAX_DELAY) == pdTRUE) {
+        if (!pendingBuildings.empty() &&
+            pendingBuildings.front().uid == pending.uid &&
+            pendingBuildings.front().type == pending.type) {
+            pendingBuildings.erase(pendingBuildings.begin());
+        }
+        xSemaphoreGive(pendingMutex);
+    }
+
+    Serial.println("[Net] Queued building confirmed by server.");
+}
+} // namespace
 
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -34,20 +128,24 @@ void connectWiFi() {
 }
 
 void networkSetup() {
-    Serial.println("\n[Net] Wiping old WiFi cache...");
-    WiFi.disconnect(true, true);
+    WiFi.onEvent(onWiFiEvent);
+
+    Serial.println("\n[Net] Resetting WiFi state...");
+    // Turn WiFi off without erasing saved AP configuration from NVS.
+    WiFi.disconnect(true, false);
     delay(1000);
-    
+
     Serial.println("[Net] Setting WiFi OFF mode");
     WiFi.mode(WIFI_OFF);
     delay(1000);
 
     Serial.println("[Net] Setting Station Mode...");
     WiFi.mode(WIFI_STA);
-    
+    WiFi.setAutoReconnect(true);
+
     Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    
+
     Serial.print("[Net] Waiting for connection");
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -55,11 +153,12 @@ void networkSetup() {
         Serial.print(".");
         attempts++;
     }
-    
+
     if (WiFi.status() == WL_CONNECTED) {
         Serial.println("\n[Net] WiFi Connected successfully!");
         Serial.print("[Net] IP Address: ");
         Serial.println(WiFi.localIP());
+        Serial.printf("[Net] RSSI: %d dBm\n", WiFi.RSSI());
     } else {
         Serial.println("\n[Net] Initial connection timed out. Will keep trying in background.");
     }
@@ -75,26 +174,29 @@ bool authenticate() {
     JsonDocument doc;
     doc["username"] = BOARD_USERNAME;
     doc["password"] = BOARD_PASSWORD;
-    
+
     String requestBody;
     serializeJson(doc, requestBody);
 
     int httpCode = http.POST(requestBody);
     bool success = false;
 
-    if (httpCode == 200) {
+    if (httpCode == HTTP_CODE_OK) {
         String payload = http.getString();
         JsonDocument responseDoc;
         DeserializationError error = deserializeJson(responseDoc, payload);
-        
+
         if (!error && responseDoc["token"].is<String>()) {
             jwtToken = responseDoc["token"].as<String>();
             Serial.println("[Net] API Authentication successful. JWT Token acquired.");
             success = true;
+        } else {
+            Serial.println("[Net] API Auth response was invalid.");
         }
     } else {
-        Serial.printf("[Net] API Auth failed. HTTP Code: %d\n", httpCode);
+        logHttpFailure("/login", httpCode);
     }
+
     http.end();
     return success;
 }
@@ -105,24 +207,30 @@ bool registerBoard() {
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/register");
     http.addHeader("Authorization", "Bearer " + jwtToken);
-    
+
     int httpCode = http.POST("");
     bool success = false;
 
-    if (httpCode == 200) {
+    if (httpCode == HTTP_CODE_OK) {
         WiFiClient* stream = http.getStreamPtr();
-        if (stream->available() >= 2) {
-            uint8_t status = stream->read();
-            stream->read(); // len
-            if (status == 1) {
-                Serial.println("[Net] Board binary registration successful!");
-                success = true;
-            }
+        uint8_t response[2];
+
+        if (readExact(stream, response, sizeof(response)) && response[0] == 1) {
+            Serial.println("[Net] Board binary registration successful!");
+            success = true;
+        } else {
+            Serial.println("[Net] Registration response was incomplete or invalid.");
         }
     } else {
-        Serial.printf("[Net] Registration failed. HTTP Code: %d\n", httpCode);
-        jwtToken = ""; // Force re-auth on next cycle
+        logHttpFailure("/register", httpCode);
     }
+
+    if (!success) {
+        // Preserve the existing behavior of forcing a fresh login after
+        // registration failure, including malformed/incomplete 200 responses.
+        jwtToken = "";
+    }
+
     http.end();
     return success;
 }
@@ -133,112 +241,174 @@ void pollGameState() {
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/poll_binary");
     http.addHeader("Authorization", "Bearer " + jwtToken);
-    
-    if (http.GET() == 200) {
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
         WiFiClient* stream = http.getStreamPtr();
-        if (stream->available() >= 1) {
-            uint8_t prod_count = stream->read();
-            for (int i = 0; i < prod_count; i++) {
-                uint8_t source_id = stream->read();
-                int32_t coeff_mw = readBE32(stream);
-                float coeff = coeff_mw / 1000.0;
-                
-                if (source_id <= 8) currentCoefficient[source_id] = coeff;
-            }
-            if (stream->available() >= 1) {
-                uint8_t cons_count = stream->read();
-                for (int i = 0; i < cons_count; i++) {
-                    stream->read(); // building_id
-                    readBE32(stream); // cons_mw
+        uint8_t prodCount = 0;
+
+        bool ok = readByte(stream, prodCount);
+        if (ok && prodCount <= 9) {
+            for (uint8_t i = 0; i < prodCount && ok; ++i) {
+                uint8_t sourceId = 0;
+                int32_t coeffMw = 0;
+                ok = readByte(stream, sourceId) && readBE32(stream, coeffMw);
+                if (ok && sourceId <= 8) {
+                    currentCoefficient[sourceId] = coeffMw / 1000.0f;
                 }
             }
-        } else {
-            for(int j = 0; j <= 8; j++) currentCoefficient[j] = 0.0;
+
+            uint8_t consCount = 0;
+            if (ok) ok = readByte(stream, consCount);
+            if (ok && consCount <= BUILDING_COUNT) {
+                for (uint8_t i = 0; i < consCount && ok; ++i) {
+                    uint8_t buildingId = 0;
+                    int32_t consumptionMw = 0;
+                    ok = readByte(stream, buildingId) &&
+                         readBE32(stream, consumptionMw);
+                }
+            } else if (ok) {
+                Serial.printf("[Net] /poll_binary invalid consumption count: %u\n", consCount);
+                ok = false;
+            }
+        } else if (ok) {
+            Serial.printf("[Net] /poll_binary invalid production count: %u\n", prodCount);
+            ok = false;
+        }
+
+        if (!ok) {
+            Serial.println("[Net] /poll_binary body was incomplete or invalid; keeping previous state.");
+        }
+    } else {
+        if (!handleAuthFailure(httpCode, "/poll_binary")) {
+            logHttpFailure("/poll_binary", httpCode);
         }
     }
+
     http.end();
 }
 
 void pollProductionRanges() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-    
+
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/prod_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
-    
-    if (http.GET() == 200) {
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
         WiFiClient* stream = http.getStreamPtr();
-        if (stream->available() >= 1) {
-            uint8_t count = stream->read();
-            for (int i = 0; i < count; i++) {
-                uint8_t source_id = stream->read();
-                int32_t min_power_mw = readBE32(stream) / 1000;
-                int32_t max_power_mw = readBE32(stream) / 1000;
-                
-                if (source_id <= 8) {
-                    baseMinMW[source_id] = min_power_mw;
-                    baseMaxMW[source_id] = max_power_mw;
+        uint8_t count = 0;
+        bool ok = readByte(stream, count);
+
+        if (ok && count <= 9) {
+            for (uint8_t i = 0; i < count && ok; ++i) {
+                uint8_t sourceId = 0;
+                int32_t minPowerMw = 0;
+                int32_t maxPowerMw = 0;
+
+                ok = readByte(stream, sourceId) &&
+                     readBE32(stream, minPowerMw) &&
+                     readBE32(stream, maxPowerMw);
+
+                if (ok && sourceId <= 8) {
+                    baseMinMW[sourceId] = minPowerMw / 1000;
+                    baseMaxMW[sourceId] = maxPowerMw / 1000;
                 }
             }
+        } else if (ok) {
+            Serial.printf("[Net] /prod_vals invalid count: %u\n", count);
+            ok = false;
+        }
+
+        if (!ok) {
+            Serial.println("[Net] /prod_vals body was incomplete or invalid.");
+        }
+    } else {
+        if (!handleAuthFailure(httpCode, "/prod_vals")) {
+            logHttpFailure("/prod_vals", httpCode);
         }
     }
+
     http.end();
 }
 
 void pollConsumptionValues() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-    
+
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/cons_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
-    
-    if (http.GET() == 200) {
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
         WiFiClient* stream = http.getStreamPtr();
-        if (stream->available() >= 1) {
-            uint8_t count = stream->read();
-            for (int i = 0; i < count; i++) {
-                uint8_t b_id = stream->read();
-                int32_t cons_mw = readBE32(stream);
-                if (b_id < 0x12) {
-                    buildingConsumptionMW[b_id] = cons_mw / 1000;
+        uint8_t count = 0;
+        bool ok = readByte(stream, count);
+
+        if (ok && count <= BUILDING_COUNT) {
+            for (uint8_t i = 0; i < count && ok; ++i) {
+                uint8_t buildingId = 0;
+                int32_t consumptionMw = 0;
+
+                ok = readByte(stream, buildingId) &&
+                     readBE32(stream, consumptionMw);
+
+                if (ok && buildingId < BUILDING_COUNT) {
+                    buildingConsumptionMW[buildingId] = consumptionMw / 1000;
                 }
             }
+        } else if (ok) {
+            Serial.printf("[Net] /cons_vals invalid count: %u\n", count);
+            ok = false;
         }
-    }    
+
+        if (!ok) {
+            Serial.println("[Net] /cons_vals body was incomplete or invalid.");
+        }
+    } else {
+        if (!handleAuthFailure(httpCode, "/cons_vals")) {
+            logHttpFailure("/cons_vals", httpCode);
+        }
+    }
+
     http.end();
 }
 
 void postTelemetry() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-    
+
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/post_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
     http.addHeader("Content-Type", "application/octet-stream");
 
-    std::vector<uint8_t> payload;
-    payload.reserve(8); // Only two 4-byte ints
+    uint8_t payload[8];
 
-    // Pack production (4 bytes, big-endian)
-    payload.push_back((currentTotalProduction_MW >> 24) & 0xFF);
-    payload.push_back((currentTotalProduction_MW >> 16) & 0xFF);
-    payload.push_back((currentTotalProduction_MW >> 8) & 0xFF);
-    payload.push_back(currentTotalProduction_MW & 0xFF);
-    
-    // Pack consumption (4 bytes, big-endian)
-    payload.push_back((currentTotalConsumption_MW >> 24) & 0xFF);
-    payload.push_back((currentTotalConsumption_MW >> 16) & 0xFF);
-    payload.push_back((currentTotalConsumption_MW >> 8) & 0xFF);
-    payload.push_back(currentTotalConsumption_MW & 0xFF);
+    payload[0] = (currentTotalProduction_MW >> 24) & 0xFF;
+    payload[1] = (currentTotalProduction_MW >> 16) & 0xFF;
+    payload[2] = (currentTotalProduction_MW >> 8) & 0xFF;
+    payload[3] = currentTotalProduction_MW & 0xFF;
 
-    http.POST(payload.data(), payload.size());
+    payload[4] = (currentTotalConsumption_MW >> 24) & 0xFF;
+    payload[5] = (currentTotalConsumption_MW >> 16) & 0xFF;
+    payload[6] = (currentTotalConsumption_MW >> 8) & 0xFF;
+    payload[7] = currentTotalConsumption_MW & 0xFF;
+
+    int httpCode = http.POST(payload, sizeof(payload));
+    if (httpCode < 200 || httpCode >= 300) {
+        if (!handleAuthFailure(httpCode, "/post_vals")) {
+            logHttpFailure("/post_vals", httpCode);
+        }
+    }
+
     http.end();
 }
 
 void networkTaskImpl(void *pvParameters) {
     for (;;) {
         unsigned long now = millis();
-        
+
         if (WiFi.status() != WL_CONNECTED) {
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
                 lastNetworkRetry = now;
@@ -250,28 +420,34 @@ void networkTaskImpl(void *pvParameters) {
 
         if (jwtToken == "") {
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
-                lastNetworkRetry = now; 
+                lastNetworkRetry = now;
                 Serial.println("[Net] Attempting API Authentication...");
                 if (authenticate()) {
                     registerBoard();
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
-            continue; 
+            continue;
         }
 
         if (now - lastPollMs >= POLL_INTERVAL) {
             lastPollMs = now;
             pollGameState();
-            pollProductionRanges();
-            pollConsumptionValues();
-            pollBuildingCounts();
+
+            // A previous request may have invalidated the token.
+            if (jwtToken != "") pollProductionRanges();
+            if (jwtToken != "") pollConsumptionValues();
+            if (jwtToken != "") pollBuildingCounts();
         }
 
-        if (now - lastPostMs >= POST_INTERVAL) {
+        if (jwtToken != "" && now - lastPostMs >= POST_INTERVAL) {
             lastPostMs = now;
             postTelemetry();
         }
+
+        // Keep all HTTP operations on this task. This avoids concurrent HTTP/JWT
+        // access from the Arduino loop task when NFC buildings are queued.
+        processPendingBuildingUpload(now);
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -282,12 +458,10 @@ void startNetworkTask() {
     Serial.println("[Net] Network Task started on Core 0");
 }
 
-void sendAddBuilding(uint8_t type, const String& uid) {
-    /*Serial.printf("[Net] sendAddBuilding called: type=%d, uid=%s\n", type, uid.c_str());
+bool sendAddBuilding(uint8_t type, const String& uid) {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) {
-        Serial.println("[Net] sendAddBuilding: no token or WiFi");
-        return;
-    }*/
+        return false;
+    }
 
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/board/add_building");
@@ -297,37 +471,48 @@ void sendAddBuilding(uint8_t type, const String& uid) {
     std::vector<uint8_t> payload;
     payload.reserve(2 + uid.length());
     payload.push_back(type);
-    payload.push_back(uid.length());
+    payload.push_back(static_cast<uint8_t>(uid.length()));
     for (size_t i = 0; i < uid.length(); i++) {
         payload.push_back(uid[i]);
     }
 
     int code = http.POST(payload.data(), payload.size());
-    Serial.printf("[Net] sendAddBuilding HTTP code: %d\n", code);
+    bool success = code >= 200 && code < 300;
+
+    if (!success) {
+        if (!handleAuthFailure(code, "/board/add_building")) {
+            logHttpFailure("/board/add_building", code);
+        }
+    } else {
+        Serial.printf("[Net] sendAddBuilding succeeded. HTTP code: %d\n", code);
+    }
 
     http.end();
+    return success;
 }
 
 void pollBuildingCounts() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
+
     HTTPClient http;
     http.begin(String(API_BASE_URL) + "/board/get_counts");
     http.addHeader("Authorization", "Bearer " + jwtToken);
+
     int code = http.GET();
-    if (code == 200) {
+    if (code == HTTP_CODE_OK) {
         WiFiClient* stream = http.getStreamPtr();
-        if (stream->available() >= BUILDING_COUNT) {
-            for (int i = 0; i < BUILDING_COUNT; i++) {
-                authoritativeBuildingCounts[i] = stream->read();
-            }
-            
-            /*Serial.printf("[Net] Counts: ");
-            for (int i = 0; i < BUILDING_COUNT; i++) {
-                Serial.printf("%d ", authoritativeBuildingCounts[i]);
-            }
-            Serial.println();
-            */
+        uint8_t counts[BUILDING_COUNT];
+
+        if (readExact(stream, counts, sizeof(counts))) {
+            memcpy(authoritativeBuildingCounts, counts, sizeof(counts));
+        } else {
+            Serial.println("[Net] /board/get_counts body was incomplete.");
+        }
+    } else {
+        if (!handleAuthFailure(code, "/board/get_counts")) {
+            logHttpFailure("/board/get_counts", code);
         }
     }
+
     http.end();
 }

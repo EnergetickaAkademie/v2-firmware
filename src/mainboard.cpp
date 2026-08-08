@@ -65,7 +65,7 @@ bool updateBargraphs() {
 
 	for (size_t i = 0; i < DEVICE_COUNT; ++i) {
 		if (!encoders[i] || !bargraphs[i]) continue;
-		
+
 		int32_t activeMin = 0;
 		int32_t activeMax = 0;
 		float displayCoeff = 0.0;
@@ -82,11 +82,11 @@ bool updateBargraphs() {
 				displayCoeff = currentCoefficient[5];
 				break;
 			case 2:
-				activeMin = (int32_t)(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) + 
+				activeMin = (int32_t)(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) +
 							(int32_t)(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
-				activeMax = (int32_t)(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) + 
+				activeMax = (int32_t)(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) +
 							(int32_t)(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
-				displayCoeff = max(currentCoefficient[8], currentCoefficient[6]); 
+				displayCoeff = max(currentCoefficient[8], currentCoefficient[6]);
 				break;
 			case 3:
 				activeMin = (int32_t)(baseMinMW[3] * connectedCount[3] * currentCoefficient[3]);
@@ -99,16 +99,16 @@ bool updateBargraphs() {
 				displayCoeff = currentCoefficient[4];
 				break;
 			case 5:
-				activeMin = (int32_t)(baseMinMW[2] * connectedCount[2] * currentCoefficient[2]) + 
+				activeMin = (int32_t)(baseMinMW[2] * connectedCount[2] * currentCoefficient[2]) +
 							(int32_t)(baseMinMW[1] * connectedCount[1] * currentCoefficient[1]);
-				activeMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]) + 
+				activeMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]) +
 							(int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
-				displayCoeff = max(currentCoefficient[2], currentCoefficient[1]); 
+				displayCoeff = max(currentCoefficient[2], currentCoefficient[1]);
 				break;
 		}
 
 		int32_t val = encoders[i]->get_value();
-		float pct = 0.0f; 
+		float pct = 0.0f;
 
 		if (displayCoeff <= 0.0 || activeMax == 0) {
 			val = 0;
@@ -119,7 +119,7 @@ bool updateBargraphs() {
 			bargraphs[i]->setEnabled(false);
 		} else {
 			bargraphs[i]->setEnabled(true);
-			
+
 			if (val < activeMin) {
 				val = activeMin;
 				encoders[i]->set_value(val);
@@ -139,7 +139,7 @@ bool updateBargraphs() {
 			bargraphs[i]->setRange(activeMin, activeMax);
 			bargraphs[i]->setValue(val);
 		}
-		
+
 		encoderPercentages[i] = pct;
 
 		if (encoderValuesMW[i] != val) {
@@ -150,26 +150,10 @@ bool updateBargraphs() {
 	return anyChanged;
 }
 
-void processPendingBuildings() {
-	if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
-	if (pendingMutex == nullptr) return;
-
-	if (xSemaphoreTake(pendingMutex, 0) == pdTRUE) {
-		if (!pendingBuildings.empty()) {
-			PendingBuilding pb = pendingBuildings.front();
-			pendingBuildings.erase(pendingBuildings.begin());
-			xSemaphoreGive(pendingMutex);
-			sendAddBuilding(pb.type, pb.uid);   // HTTP now outside I2C context
-		} else {
-			xSemaphoreGive(pendingMutex);
-		}
-	}
-}
-
 void nfcTaskImpl(void *pvParameters) {
 	for (;;) {
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
-		uint8_t uidLength;
+		uint8_t uidLength = 0;
 
 		if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
 			Serial.println("[NFC] Tag detected!");
@@ -188,6 +172,7 @@ void nfcTaskImpl(void *pvParameters) {
 			}
 			if (alreadyScanned) {
 				Serial.println("[NFC] Already scanned, ignoring.");
+				vTaskDelay(pdMS_TO_TICKS(150));
 				continue;
 			}
 
@@ -195,8 +180,16 @@ void nfcTaskImpl(void *pvParameters) {
 			bool readSuccess = false;
 
 			if (uidLength == 7) {
-				if (nfc.mifareultralight_ReadPage(4, data) && nfc.mifareultralight_ReadPage(8, data + 16)) {
-					readSuccess = true;
+				// The current PN532 library copies 4 bytes per Ultralight read.
+				// Read all eight pages needed to populate the same 32-byte
+				// buffer the existing parser already expects.
+				readSuccess = true;
+				for (uint8_t page = 4; page < 12; ++page) {
+					uint8_t* pageData = data + ((page - 4) * 4);
+					if (!nfc.mifareultralight_ReadPage(page, pageData)) {
+						readSuccess = false;
+						break;
+					}
 				}
 			} else if (uidLength == 4) {
 				uint8_t keyNDEF[6]      = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
@@ -269,8 +262,8 @@ void startNfcTask() {
 
 void setup() {
 	Serial.begin(115200);
-	delay(1000); 
-	
+	delay(1000);
+
 	Serial.println("\n\n[Main] Booting ESP32-S3...");
 
 	pinMode(BUZZER_PIN, OUTPUT);
@@ -278,7 +271,7 @@ void setup() {
 
 	Wire.begin(SDA_PIN, SCL_PIN);
 	Wire.setClock(100000);
-	
+
 	pendingMutex = xSemaphoreCreateMutex();
 
 	nfc.begin();
@@ -286,12 +279,12 @@ void setup() {
 	if (!versiondata) {
 		Serial.println("[NFC] PN532 board not found via I2C");
 	} else {
-		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n", 
+		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n",
 			(versiondata>>24) & 0xFF, (versiondata>>16) & 0xFF, (versiondata>>8) & 0xFF);
 		nfc.SAMConfig();
 		startNfcTask();
 	}
-	
+
 	initSubstations();
 	networkSetup();
 	startNetworkTask();
@@ -320,15 +313,15 @@ void setup() {
 
 	Bargraph* bg5 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
 	Bargraph* bg4 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-	disp3 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
-	
+	disp3 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
+
 	Bargraph* bg3 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
 	Bargraph* bg2 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-	disp2 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
-	
+	disp2 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
+
 	Bargraph* bg1 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
 	Bargraph* bg0 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
-	disp1 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT); 
+	disp1 = factory.createSegmentDisplayPair(outChain, DISPLAY_DIGIT_COUNT);
 
 	bargraphs.push_back(bg0);
 	bargraphs.push_back(bg1);
@@ -348,7 +341,7 @@ void setup() {
 
 	displayTimer = timerBegin(0, 80, true);
 	timerAttachInterrupt(displayTimer, &onDisplayTimer, false);
-	timerAlarmWrite(displayTimer, 1000, true); 
+	timerAlarmWrite(displayTimer, 1000, true);
 	timerAlarmEnable(displayTimer);
 }
 
@@ -374,33 +367,33 @@ void loop() {
 	queueSubstationUpdates();
 
 	int32_t totalProdThisCycle = 0;
-	
+
 	for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-		if (i == 2 || i == 5) continue; 
+		if (i == 2 || i == 5) continue;
 		uint8_t typeID = apiTypeMap[i];
 		productionByTypeMW[typeID] = encoderValuesMW[i];
 		totalProdThisCycle += encoderValuesMW[i];
 	}
-	
+
 	int32_t sharedVal = encoderValuesMW[2];
-	productionByTypeMW[8] = sharedVal / 2; 
-	productionByTypeMW[6] = sharedVal - productionByTypeMW[8]; 
-	totalProdThisCycle += sharedVal; 
-	
+	productionByTypeMW[8] = sharedVal / 2;
+	productionByTypeMW[6] = sharedVal - productionByTypeMW[8];
+	totalProdThisCycle += sharedVal;
+
 	int32_t solarActiveMax = (int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
 	int32_t windActiveMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]);
-	
-	productionByTypeMW[1] = solarActiveMax; 
-	productionByTypeMW[2] = windActiveMax; 
-	
+
+	productionByTypeMW[1] = solarActiveMax;
+	productionByTypeMW[2] = windActiveMax;
+
 	int32_t combinedWeatherPower = solarActiveMax + windActiveMax;
 	totalProdThisCycle += combinedWeatherPower;
-	
+
 	encoderValuesMW[5] = combinedWeatherPower;
 	if (encoders.size() > 5 && encoders[5]) {
 		encoders[5]->set_value(combinedWeatherPower);
 	}
-	
+
 	currentTotalProduction_MW = totalProdThisCycle;
 
 	uint32_t totalConsThisCycle = 0;
@@ -410,12 +403,6 @@ void loop() {
 	currentTotalConsumption_MW = totalConsThisCycle;
 
 	//Serial.printf("[Main] Consumption: totalConsThisCycle=%u, currentTotalConsumption_MW=%u\n", totalConsThisCycle, currentTotalConsumption_MW);
-
-	static uint32_t lastPendingProcess = 0;
-	if (now - lastPendingProcess >= 100) {
-		lastPendingProcess = now;
-		processPendingBuildings();
-	}
 
 	if (now - lastLedToggleMs >= 500) {
 		lastLedToggleMs = now;
