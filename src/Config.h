@@ -23,6 +23,22 @@
 	#define BOARD_PASSWORD "board123"
 #endif
 
+#ifndef OTA_PASSWORD
+	#define OTA_PASSWORD "CHANGE_ME"
+#endif
+
+#ifndef OTA_HOSTNAME
+	#define OTA_HOSTNAME "enak-mainboard"
+#endif
+
+#ifndef OTA_PORT
+	#define OTA_PORT 8080
+#endif
+
+#ifndef FIRMWARE_VERSION
+	#define FIRMWARE_VERSION "dev"
+#endif
+
 #define OUT_LATCH_PIN 10
 #define OUT_DATA_PIN  11
 #define SHARED_CLOCK_PIN 12

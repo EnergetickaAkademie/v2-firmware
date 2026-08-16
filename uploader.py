@@ -5,6 +5,9 @@ import json
 import subprocess
 import configparser
 import re
+from pathlib import Path
+
+import requests
 from PyQt5.QtWidgets import (
 	QApplication,
 	QWidget,
@@ -18,8 +21,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
-UID_FILE = "used_uids.json"
-MAINBOARD_CONFIG_FILE = "uploader.conf"
+PROJECT_DIR = Path(__file__).resolve().parent
+UID_FILE = PROJECT_DIR / "used_uids.json"
+MAINBOARD_CONFIG_FILE = PROJECT_DIR / "uploader.conf"
 
 class PioUploadThread(QThread):
 	log_signal = pyqtSignal(str)
@@ -36,14 +40,15 @@ class PioUploadThread(QThread):
 		
 		env["PLATFORMIO_BUILD_FLAGS"] = self.build_flags
 
-		self.log_signal.emit(f"--- Starting build with flags: {self.build_flags} ---")
+		self.log_signal.emit(f"--- Building and uploading {self.env_name} over serial ---")
 
 		try:
-			command = ["pio", "run", "-e", self.env_name, "-t", "clean", "-t", "upload"]
+			command = ["pio", "run", "-e", self.env_name, "-t", "upload"]
 			if self.port:
 				command.extend(["--upload-port", self.port])
 			process = subprocess.Popen(
 				command,
+				cwd=PROJECT_DIR,
 				env=env,
 				stdout=subprocess.PIPE,
 				stderr=subprocess.STDOUT,
@@ -61,6 +66,77 @@ class PioUploadThread(QThread):
 			self.finished_signal.emit(False)
 		except Exception as e:
 			self.log_signal.emit(f"ERROR: {str(e)}")
+			self.finished_signal.emit(False)
+
+class PioOtaThread(QThread):
+	log_signal = pyqtSignal(str)
+	finished_signal = pyqtSignal(bool)
+
+	def __init__(self, env_name, build_flags, host, port, password):
+		super().__init__()
+		self.env_name = env_name
+		self.build_flags = build_flags
+		self.host = host
+		self.port = port
+		self.password = password
+
+	def run(self):
+		env = os.environ.copy()
+		env["PLATFORMIO_BUILD_FLAGS"] = self.build_flags
+
+		try:
+			self.log_signal.emit(f"--- Building {self.env_name} for Wi-Fi OTA ---")
+			process = subprocess.Popen(
+				["pio", "run", "-e", self.env_name],
+				cwd=PROJECT_DIR,
+				env=env,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.STDOUT,
+				text=True,
+			)
+
+			for line in process.stdout:
+				self.log_signal.emit(line.rstrip())
+
+			process.wait()
+			if process.returncode != 0:
+				self.finished_signal.emit(False)
+				return
+
+			firmware_path = PROJECT_DIR / ".pio" / "build" / self.env_name / "firmware.bin"
+			if not firmware_path.is_file():
+				self.log_signal.emit(f"ERROR: Firmware image not found: {firmware_path}")
+				self.finished_signal.emit(False)
+				return
+
+			url = f"http://{self.host}:{self.port}/ota/firmware"
+			self.log_signal.emit(
+				f"--- Uploading {firmware_path.stat().st_size} bytes to {self.host}:{self.port} ---"
+			)
+
+			with firmware_path.open("rb") as firmware:
+				response = requests.post(
+					url,
+					headers={"X-OTA-Password": self.password},
+					files={"firmware": ("firmware.bin", firmware, "application/octet-stream")},
+					timeout=(10, 180),
+				)
+
+			if response.ok:
+				self.log_signal.emit(f"OTA accepted by board: {response.text}")
+				self.finished_signal.emit(True)
+			else:
+				self.log_signal.emit(f"ERROR: OTA failed with HTTP {response.status_code}: {response.text}")
+				self.finished_signal.emit(False)
+
+		except FileNotFoundError:
+			self.log_signal.emit("ERROR: 'pio' command not found. Ensure PlatformIO is in your system PATH.")
+			self.finished_signal.emit(False)
+		except requests.RequestException as exc:
+			self.log_signal.emit(f"ERROR: OTA connection failed: {exc}")
+			self.finished_signal.emit(False)
+		except Exception as exc:
+			self.log_signal.emit(f"ERROR: {exc}")
 			self.finished_signal.emit(False)
 
 class PioMonitorThread(QThread):
@@ -81,6 +157,7 @@ class PioMonitorThread(QThread):
 				command.extend(["--port", self.port])
 			self.process = subprocess.Popen(
 				command,
+				cwd=PROJECT_DIR,
 				stdout=subprocess.PIPE,
 				stderr=subprocess.STDOUT,
 				text=True
@@ -159,6 +236,15 @@ class PowerplantManager(QWidget):
 		self.board_username_input = QLineEdit()
 		self.board_password_input = QLineEdit()
 		self.board_password_input.setEchoMode(QLineEdit.Password)
+		self.upload_method_combo = QComboBox()
+		self.upload_method_combo.addItems(["USB / serial", "Wi-Fi OTA"])
+		self.upload_method_combo.currentTextChanged.connect(self.update_upload_method_ui)
+		self.ota_host_input = QLineEdit()
+		self.ota_port_input = QLineEdit("8080")
+		self.ota_password_input = QLineEdit()
+		self.ota_password_input.setEchoMode(QLineEdit.Password)
+		self.ota_hostname_input = QLineEdit("enak-mainboard")
+		self.firmware_version_input = QLineEdit("0.1.0")
 
 		self.show_passwords_checkbox = QCheckBox("Show passwords")
 		self.show_passwords_checkbox.toggled.connect(self.on_show_passwords_toggled)
@@ -168,6 +254,12 @@ class PowerplantManager(QWidget):
 		self.mainboard_form_layout.addRow("Server Endpoint", self.server_endpoint_input)
 		self.mainboard_form_layout.addRow("Board Username", self.board_username_input)
 		self.mainboard_form_layout.addRow("Board Password", self.board_password_input)
+		self.mainboard_form_layout.addRow("Upload method", self.upload_method_combo)
+		self.mainboard_form_layout.addRow("OTA host / IP", self.ota_host_input)
+		self.mainboard_form_layout.addRow("OTA port", self.ota_port_input)
+		self.mainboard_form_layout.addRow("OTA password", self.ota_password_input)
+		self.mainboard_form_layout.addRow("OTA hostname", self.ota_hostname_input)
+		self.mainboard_form_layout.addRow("Firmware version", self.firmware_version_input)
 		self.mainboard_form_layout.addRow("", self.show_passwords_checkbox)
 
 		layout.addWidget(self.mainboard_form_widget)
@@ -196,6 +288,7 @@ class PowerplantManager(QWidget):
 		self.resize(600, 400)
 		self.refresh_ports()
 		self.update_board_ui()
+		self.update_upload_method_ui()
 
 	def update_board_ui(self):
 		is_powerplant = self.board_combo.currentText() == "Powerplant"
@@ -210,6 +303,16 @@ class PowerplantManager(QWidget):
 		mode = QLineEdit.Normal if checked else QLineEdit.Password
 		self.wifi_password_input.setEchoMode(mode)
 		self.board_password_input.setEchoMode(mode)
+		self.ota_password_input.setEchoMode(mode)
+
+	def update_upload_method_ui(self):
+		is_ota = self.upload_method_combo.currentText() == "Wi-Fi OTA"
+		for widget in (self.ota_host_input, self.ota_port_input, self.ota_password_input):
+			widget.setEnabled(is_ota)
+		if hasattr(self, "port_combo"):
+			self.port_combo.setEnabled(not is_ota)
+			self.refresh_ports_btn.setEnabled(not is_ota)
+			self.monitor_checkbox.setEnabled(not is_ota)
 
 	def log(self, message):
 		self.output_text.append(message)
@@ -249,6 +352,11 @@ class PowerplantManager(QWidget):
 			"server_endpoint": section.get("server_endpoint").strip(),
 			"board_username": section.get("board_username").strip(),
 			"board_password": section.get("board_password").strip(),
+			"ota_host": section.get("ota_host", "").strip(),
+			"ota_port": section.get("ota_port", "8080").strip(),
+			"ota_password": section.get("ota_password", "").strip(),
+			"ota_hostname": section.get("ota_hostname", "enak-mainboard").strip(),
+			"firmware_version": section.get("firmware_version", "0.1.0").strip(),
 		}
 
 	def prefill_mainboard_fields(self):
@@ -262,6 +370,11 @@ class PowerplantManager(QWidget):
 		self.server_endpoint_input.setText(cfg["server_endpoint"])
 		self.board_username_input.setText(cfg["board_username"])
 		self.board_password_input.setText(cfg["board_password"])
+		self.ota_host_input.setText(cfg["ota_host"])
+		self.ota_port_input.setText(cfg["ota_port"])
+		self.ota_password_input.setText(cfg["ota_password"])
+		self.ota_hostname_input.setText(cfg["ota_hostname"])
+		self.firmware_version_input.setText(cfg["firmware_version"])
 
 	def get_mainboard_form_values(self):
 		cfg = {
@@ -270,10 +383,27 @@ class PowerplantManager(QWidget):
 			"server_endpoint": self.server_endpoint_input.text().strip(),
 			"board_username": self.board_username_input.text().strip(),
 			"board_password": self.board_password_input.text().strip(),
+			"ota_host": self.ota_host_input.text().strip(),
+			"ota_port": self.ota_port_input.text().strip(),
+			"ota_password": self.ota_password_input.text().strip(),
+			"ota_hostname": self.ota_hostname_input.text().strip(),
+			"firmware_version": self.firmware_version_input.text().strip(),
 		}
-		missing = [key for key, value in cfg.items() if not value]
+		required = [
+			"wifi_ssid", "wifi_password", "server_endpoint", "board_username",
+			"board_password", "ota_hostname", "firmware_version",
+		]
+		if self.upload_method_combo.currentText() == "Wi-Fi OTA":
+			required.extend(["ota_host", "ota_port", "ota_password"])
+		missing = [key for key in required if not cfg[key]]
 		if missing:
 			raise ValueError(f"Missing values: {', '.join(missing)}")
+		if cfg["ota_password"] and len(cfg["ota_password"]) < 8:
+			raise ValueError("OTA password must contain at least 8 characters")
+		try:
+			cfg["ota_port"] = str(int(cfg["ota_port"] or "8080"))
+		except ValueError as exc:
+			raise ValueError("OTA port must be an integer") from exc
 		return cfg
 
 	def refresh_ports(self):
@@ -350,6 +480,10 @@ class PowerplantManager(QWidget):
 			f'-DAPI_BASE_URL=\\"{self._escape_define_value(cfg["server_endpoint"])}\\"',
 			f'-DBOARD_USERNAME=\\"{self._escape_define_value(cfg["board_username"])}\\"',
 			f'-DBOARD_PASSWORD=\\"{self._escape_define_value(cfg["board_password"])}\\"',
+			f'-DOTA_PASSWORD=\\"{self._escape_define_value(cfg["ota_password"] or "CHANGE_ME")}\\"',
+			f'-DOTA_HOSTNAME=\\"{self._escape_define_value(cfg["ota_hostname"])}\\"',
+			f'-DOTA_PORT={cfg["ota_port"] or "8080"}',
+			f'-DFIRMWARE_VERSION=\\"{self._escape_define_value(cfg["firmware_version"])}\\"',
 		])
 
 	def start_upload(self):
@@ -383,14 +517,26 @@ class PowerplantManager(QWidget):
 			self.upload_btn.setEnabled(True)
 			return
 
-		self.upload_thread = PioUploadThread("mainboard", build_flags, selected_port)
+		is_ota = self.upload_method_combo.currentText() == "Wi-Fi OTA"
+		if is_ota:
+			self.upload_thread = PioOtaThread(
+				"mainboard",
+				build_flags,
+				cfg["ota_host"],
+				int(cfg["ota_port"]),
+				cfg["ota_password"],
+			)
+		else:
+			self.upload_thread = PioUploadThread("mainboard", build_flags, selected_port)
 		self.upload_thread.log_signal.connect(self.log)
 		self.upload_thread.finished_signal.connect(
-			lambda success: self.on_upload_finished(success, "mainboard", board_kind)
+			lambda success: self.on_upload_finished(
+				success, "mainboard", board_kind, can_monitor=not is_ota
+			)
 		)
 		self.upload_thread.start()
 
-	def on_upload_finished(self, success, env_name, board_kind, hex_uid=None, selected_type=None):
+	def on_upload_finished(self, success, env_name, board_kind, hex_uid=None, selected_type=None, can_monitor=True):
 		self.upload_btn.setEnabled(True)
 		if success:
 			if board_kind == "Powerplant" and hex_uid and selected_type:
@@ -399,7 +545,7 @@ class PowerplantManager(QWidget):
 			else:
 				self.log("\nSUCCESS: Mainboard upload complete.")
 
-			if self.monitor_checkbox.isChecked():
+			if can_monitor and self.monitor_checkbox.isChecked():
 				if self.monitor_thread and self.monitor_thread.isRunning():
 					self.monitor_thread.stop()
 				self.monitor_thread = PioMonitorThread(env_name, self.get_selected_port())

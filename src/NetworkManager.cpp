@@ -5,6 +5,7 @@
 #include <vector>
 #include "Config.h"
 #include "GameState.h"
+#include "OtaManager.h"
 
 unsigned long lastNetworkRetry = 0;
 const unsigned long NETWORK_RETRY_INTERVAL = 5000;
@@ -408,6 +409,11 @@ void postTelemetry() {
 void networkTaskImpl(void *pvParameters) {
     for (;;) {
         unsigned long now = millis();
+
+        if (isOtaInProgress()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         if (WiFi.status() != WL_CONNECTED) {
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {

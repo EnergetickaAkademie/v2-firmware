@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "GameState.h"
 #include "NetworkManager.h"
+#include "OtaManager.h"
 #include "SubstationManager.h"
 #include "PeripheralFactory.h"
 #include "BuildingTypes.h"
@@ -287,6 +288,7 @@ void setup() {
 
 	initSubstations();
 	networkSetup();
+	setupOta();
 	startNetworkTask();
 
 	statusLed = factory.createLed(STATUS_LED_PIN);
@@ -347,6 +349,7 @@ void setup() {
 
 void loop() {
 	const uint32_t now = millis();
+	handleOta();
 
 	if (now - lastCountsUpdateMs >= 200) {
 		lastCountsUpdateMs = now;
