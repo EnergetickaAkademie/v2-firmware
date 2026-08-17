@@ -1,6 +1,7 @@
 #include "SubstationManager.h"
 #include "Config.h"
 #include "GameState.h"
+#include "StatusLedManager.h"
 
 HardwareSerial subSerial1(1);
 HardwareSerial subSerial2(2);
@@ -39,6 +40,7 @@ struct Substation {
 
 Substation subs[3];
 uint8_t totalCounts[7] = {0};
+uint8_t onlineSubstationCount = 0;
 
 void initSubstations() {
     subs[0].init(&subSerial1, SUB1_RX_PIN, SUB1_TX_PIN);
@@ -192,7 +194,7 @@ void queueSubstationUpdates() {
 
 void updateTotalCounts() {
     memset(totalCounts, 0, sizeof(totalCounts));
-    int onlineSubstations = 0;
+    uint8_t onlineSubstations = 0;
 
     for (int s = 0; s < 3; s++) {
         if (millis() - subs[s].lastAlive > 4000) {
@@ -214,6 +216,8 @@ void updateTotalCounts() {
         countsChanged = true;
         lastOnlineSubstations = onlineSubstations;
     }
+    onlineSubstationCount = onlineSubstations;
+    statusLedSetSubstationCount(onlineSubstationCount);
 
     for (int i = 1; i <= 7; i++) {
         if (connectedCount[i] != totalCounts[i - 1]) {
@@ -254,4 +258,8 @@ void updateTotalCounts() {
 
         //Serial.print(outBuffer);
     }
+}
+
+uint8_t getOnlineSubstationCount() {
+    return onlineSubstationCount;
 }

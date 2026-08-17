@@ -7,6 +7,7 @@
 #include <WiFi.h>
 
 #include "Config.h"
+#include "StatusLedManager.h"
 
 namespace {
 WebServer otaServer(OTA_PORT);
@@ -59,10 +60,12 @@ void handleUploadFinished() {
         body += "}";
         sendJson(500, body);
         updateInProgress = false;
+        statusLedSetOtaState(StatusOtaState::Failed);
         return;
     }
 
     sendJson(200, "{\"success\":true,\"message\":\"firmware accepted; rebooting\"}");
+    statusLedSetOtaState(StatusOtaState::Succeeded);
     restartPending = true;
     restartRequestedAt = millis();
 }
@@ -80,11 +83,13 @@ void handleUploadChunk() {
         }
 
         updateInProgress = true;
+        statusLedSetOtaState(StatusOtaState::Uploading);
         Serial.printf("[OTA] Starting firmware upload: %s\n", upload.filename.c_str());
 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
             Serial.printf("[OTA] Update.begin failed: %u\n", Update.getError());
             updateInProgress = false;
+            statusLedSetOtaState(StatusOtaState::Failed);
         }
         return;
     }
@@ -99,6 +104,7 @@ void handleUploadChunk() {
                           static_cast<unsigned>(written));
             Update.abort();
             updateInProgress = false;
+            statusLedSetOtaState(StatusOtaState::Failed);
         }
         return;
     }
@@ -111,6 +117,7 @@ void handleUploadChunk() {
                           static_cast<unsigned>(upload.totalSize));
         } else {
             updateInProgress = false;
+            statusLedSetOtaState(StatusOtaState::Failed);
             Serial.printf("[OTA] Update.end failed: %u\n", Update.getError());
         }
         return;
@@ -120,6 +127,7 @@ void handleUploadChunk() {
         Update.abort();
         updateInProgress = false;
         uploadSucceeded = false;
+        statusLedSetOtaState(StatusOtaState::Failed);
         Serial.println("[OTA] Firmware upload aborted.");
     }
 }

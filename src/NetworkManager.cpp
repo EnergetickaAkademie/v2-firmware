@@ -6,6 +6,7 @@
 #include "Config.h"
 #include "GameState.h"
 #include "OtaManager.h"
+#include "StatusLedManager.h"
 
 unsigned long lastNetworkRetry = 0;
 const unsigned long NETWORK_RETRY_INTERVAL = 5000;
@@ -27,6 +28,16 @@ bool syncV2Available = true;
 uint32_t syncV2RetryAt = 0;
 uint32_t syncSequence = 0;
 uint32_t lastConfigRevision = 0;
+
+enum class WiFiSetupPhase {
+    Uninitialized,
+    WaitingToPowerOff,
+    WaitingToStartStation,
+    Ready,
+};
+
+WiFiSetupPhase wifiSetupPhase = WiFiSetupPhase::Uninitialized;
+uint32_t wifiSetupPhaseStartedAt = 0;
 
 enum class SyncV2Result {
     Success,
@@ -70,6 +81,8 @@ bool handleAuthFailure(int httpCode, const char* endpoint) {
                       endpoint, httpCode);
         jwtToken = "";
         boardRegistered = false;
+        statusLedSetBoardRegistered(false);
+        statusLedRecordApiFailure(StatusApiError::Authentication);
         return true;
     }
     return false;
@@ -85,6 +98,8 @@ bool handleBoardNotFound(HTTPClient& http, int httpCode, const char* endpoint) {
     Serial.printf("[Net] %s no longer recognizes this board; re-registration required.\n",
                   endpoint);
     boardRegistered = false;
+    statusLedSetBoardRegistered(false);
+    statusLedRecordApiFailure(StatusApiError::Registration);
     return true;
 }
 
@@ -110,7 +125,9 @@ int32_t readBE32(const uint8_t* source) {
     return static_cast<int32_t>(readBEU32(source));
 }
 
-void logHttpFailure(const char* endpoint, int httpCode) {
+void logHttpFailure(const char* endpoint,
+                    int httpCode,
+                    StatusApiError statusError = StatusApiError::None) {
     if (httpCode < 0) {
         Serial.printf("[Net] %s failed: %s (%d)\n",
                       endpoint,
@@ -119,16 +136,25 @@ void logHttpFailure(const char* endpoint, int httpCode) {
     } else {
         Serial.printf("[Net] %s failed: HTTP %d\n", endpoint, httpCode);
     }
+
+    if (statusError == StatusApiError::None) {
+        statusError = (httpCode < 0 || httpCode >= 500)
+                          ? StatusApiError::Unreachable
+                          : StatusApiError::InvalidResponse;
+    }
+    statusLedRecordApiFailure(statusError);
 }
 
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            statusLedSetWifiConnected(true);
             Serial.printf("[WiFi] Connected. IP=%s RSSI=%d dBm\n",
                           WiFi.localIP().toString().c_str(),
                           WiFi.RSSI());
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            statusLedSetWifiConnected(false);
             Serial.printf("[WiFi] Disconnected. reason=%d\n",
                           info.wifi_sta_disconnected.reason);
             break;
@@ -172,6 +198,30 @@ void processPendingBuildingUpload(uint32_t now) {
 
     Serial.println("[Net] Queued building confirmed by server.");
 }
+
+bool advanceWiFiSetup(uint32_t now) {
+    if (wifiSetupPhase == WiFiSetupPhase::WaitingToPowerOff &&
+        now - wifiSetupPhaseStartedAt >= 1000) {
+        Serial.println("[Net] Setting WiFi OFF mode");
+        WiFi.mode(WIFI_OFF);
+        wifiSetupPhase = WiFiSetupPhase::WaitingToStartStation;
+        wifiSetupPhaseStartedAt = now;
+    }
+
+    if (wifiSetupPhase == WiFiSetupPhase::WaitingToStartStation &&
+        now - wifiSetupPhaseStartedAt >= 1000) {
+        Serial.println("[Net] Setting Station Mode...");
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+
+        Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        lastNetworkRetry = now;
+        wifiSetupPhase = WiFiSetupPhase::Ready;
+    }
+
+    return wifiSetupPhase == WiFiSetupPhase::Ready;
+}
 } // namespace
 
 void connectWiFi() {
@@ -182,39 +232,14 @@ void connectWiFi() {
 
 void networkSetup() {
     WiFi.onEvent(onWiFiEvent);
+    statusLedSetWifiConnected(false);
+    statusLedSetBoardRegistered(false);
 
     Serial.println("\n[Net] Resetting WiFi state...");
     // Turn WiFi off without erasing saved AP configuration from NVS.
     WiFi.disconnect(true, false);
-    delay(1000);
-
-    Serial.println("[Net] Setting WiFi OFF mode");
-    WiFi.mode(WIFI_OFF);
-    delay(1000);
-
-    Serial.println("[Net] Setting Station Mode...");
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-
-    Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    Serial.print("[Net] Waiting for connection");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[Net] WiFi Connected successfully!");
-        Serial.print("[Net] IP Address: ");
-        Serial.println(WiFi.localIP());
-        Serial.printf("[Net] RSSI: %d dBm\n", WiFi.RSSI());
-    } else {
-        Serial.println("\n[Net] Initial connection timed out. Will keep trying in background.");
-    }
+    wifiSetupPhase = WiFiSetupPhase::WaitingToPowerOff;
+    wifiSetupPhaseStartedAt = millis();
 }
 
 bool authenticate() {
@@ -242,12 +267,18 @@ bool authenticate() {
         if (!error && responseDoc["token"].is<String>()) {
             jwtToken = responseDoc["token"].as<String>();
             Serial.println("[Net] API Authentication successful. JWT Token acquired.");
+            statusLedRecordApiSuccess();
             success = true;
         } else {
             Serial.println("[Net] API Auth response was invalid.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         }
     } else {
-        logHttpFailure("/login", httpCode);
+        logHttpFailure("/login",
+                       httpCode,
+                       (httpCode == 401 || httpCode == 403)
+                           ? StatusApiError::Authentication
+                           : StatusApiError::None);
     }
 
     http.end();
@@ -271,12 +302,19 @@ bool registerBoard() {
         if (readExact(stream, response, sizeof(response)) && response[0] == 1) {
             Serial.println("[Net] Board binary registration successful!");
             boardRegistered = true;
+            statusLedSetBoardRegistered(true);
+            statusLedRecordApiSuccess();
             success = true;
         } else {
             Serial.println("[Net] Registration response was incomplete or invalid.");
+            statusLedRecordApiFailure(StatusApiError::Registration);
         }
     } else {
-        logHttpFailure("/register", httpCode);
+        logHttpFailure("/register",
+                       httpCode,
+                       (httpCode >= 0 && httpCode < 500)
+                           ? StatusApiError::Registration
+                           : StatusApiError::None);
     }
 
     if (!success) {
@@ -284,6 +322,7 @@ bool registerBoard() {
         // registration failure, including malformed/incomplete 200 responses.
         jwtToken = "";
         boardRegistered = false;
+        statusLedSetBoardRegistered(false);
     }
 
     http.end();
@@ -302,6 +341,7 @@ void pollGameState() {
         if (http.getSize() == 0) {
             // An inactive game is represented by an empty legacy response.
             // Do not enter a blocking stream read or discard the last valid state.
+            statusLedRecordApiSuccess();
             http.end();
             return;
         }
@@ -340,6 +380,9 @@ void pollGameState() {
 
         if (!ok) {
             Serial.println("[Net] /poll_binary body was incomplete or invalid; keeping previous state.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+        } else {
+            statusLedRecordApiSuccess();
         }
     } else {
         if (!handleAuthFailure(httpCode, "/poll_binary") &&
@@ -386,6 +429,9 @@ void pollProductionRanges() {
 
         if (!ok) {
             Serial.println("[Net] /prod_vals body was incomplete or invalid.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+        } else {
+            statusLedRecordApiSuccess();
         }
     } else {
         if (!handleAuthFailure(httpCode, "/prod_vals") &&
@@ -429,6 +475,9 @@ void pollConsumptionValues() {
 
         if (!ok) {
             Serial.println("[Net] /cons_vals body was incomplete or invalid.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+        } else {
+            statusLedRecordApiSuccess();
         }
     } else {
         if (!handleAuthFailure(httpCode, "/cons_vals") &&
@@ -470,11 +519,14 @@ SyncV2Result syncBoardV2() {
         if (body == "BOARD_NOT_FOUND") {
             Serial.println("[Net] /board/sync/v2 requires board re-registration.");
             boardRegistered = false;
+            statusLedSetBoardRegistered(false);
+            statusLedRecordApiFailure(StatusApiError::Registration);
             http.end();
             return SyncV2Result::Failed;
         }
 
         Serial.println("[Net] /board/sync/v2 is unavailable; temporarily using legacy endpoints.");
+        statusLedRecordApiSuccess();
         http.end();
         return SyncV2Result::NotSupported;
     }
@@ -490,12 +542,14 @@ SyncV2Result syncBoardV2() {
     int responseSize = http.getSize();
     if (responseSize >= 0 && responseSize != static_cast<int>(SYNC_V2_RESPONSE_SIZE)) {
         Serial.printf("[Net] /board/sync/v2 invalid response size: %d\n", responseSize);
+        statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         http.end();
         return SyncV2Result::Failed;
     }
 
     uint8_t response[SYNC_V2_RESPONSE_SIZE];
     if (!readExact(http.getStreamPtr(), response, sizeof(response))) {
+        statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         http.end();
         return SyncV2Result::Failed;
     }
@@ -506,6 +560,7 @@ SyncV2Result syncBoardV2() {
     if (response[0] != 'E' || response[1] != 'A' || response[2] != 2 ||
         (flags & ~0x01) != 0 || echoedSequence != sequence) {
         Serial.println("[Net] /board/sync/v2 invalid header or sequence.");
+        statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         return SyncV2Result::Failed;
     }
 
@@ -530,6 +585,7 @@ SyncV2Result syncBoardV2() {
         int32_t value = readBE32(response + offset);
         if (value < 0) {
             Serial.println("[Net] /board/sync/v2 rejected negative building consumption.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
             return SyncV2Result::Failed;
         }
         nextConsumption[i] = static_cast<uint32_t>(value / 1000);
@@ -548,6 +604,7 @@ SyncV2Result syncBoardV2() {
                       (flags & 0x01) ? "active" : "inactive");
         lastConfigRevision = configRevision;
     }
+    statusLedRecordApiSuccess();
     return SyncV2Result::Success;
 }
 
@@ -572,6 +629,8 @@ void postTelemetry() {
             !handleBoardNotFound(http, httpCode, "/post_vals")) {
             logHttpFailure("/post_vals", httpCode);
         }
+    } else {
+        statusLedRecordApiSuccess();
     }
 
     http.end();
@@ -586,7 +645,13 @@ void networkTaskImpl(void *pvParameters) {
             continue;
         }
 
+        if (!advanceWiFiSetup(now)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         if (WiFi.status() != WL_CONNECTED) {
+            statusLedSetWifiConnected(false);
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
                 lastNetworkRetry = now;
                 connectWiFi();
@@ -594,6 +659,8 @@ void networkTaskImpl(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+
+        statusLedSetWifiConnected(true);
 
         if (jwtToken == "") {
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
@@ -688,6 +755,7 @@ bool sendAddBuilding(uint8_t type, const String& uid) {
         }
     } else {
         Serial.printf("[Net] sendAddBuilding succeeded. HTTP code: %d\n", code);
+        statusLedRecordApiSuccess();
     }
 
     http.end();
@@ -708,8 +776,10 @@ void pollBuildingCounts() {
 
         if (readExact(stream, counts, sizeof(counts))) {
             memcpy(authoritativeBuildingCounts, counts, sizeof(counts));
+            statusLedRecordApiSuccess();
         } else {
             Serial.println("[Net] /board/get_counts body was incomplete.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         }
     } else {
         if (!handleAuthFailure(code, "/board/get_counts") &&

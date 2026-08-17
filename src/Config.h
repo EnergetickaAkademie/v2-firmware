@@ -46,6 +46,8 @@
 #define IN_LOAD_PIN 14
 
 #define STATUS_LED_PIN 38
+#define STATUS_RGB_LED_PIN 7
+#define STATUS_RGB_LED_BRIGHTNESS 48
 
 #define SUB1_RX_PIN 43
 #define SUB1_TX_PIN 44

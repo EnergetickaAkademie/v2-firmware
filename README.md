@@ -21,3 +21,30 @@ binary `POST /board/sync/v2` request every 500 ms. The response echoes the
 request sequence and carries a configuration revision, so a complete snapshot
 is validated before it replaces the local values. Firmware temporarily falls
 back to the legacy endpoints when CoreAPI does not yet expose the v2 route.
+
+## Mainboard status LED
+
+The user-visible WS2812 status LED is connected to GPIO 7. The original red
+GPIO 38 board LED remains an internal heartbeat indicator.
+
+| Pattern | Meaning |
+| --- | --- |
+| White breathing | Mainboard initialization |
+| Blue breathing | Connecting to Wi-Fi |
+| Blue double flash | Wi-Fi connection lost |
+| Purple breathing | Authenticating or registering with CoreAPI |
+| Purple double flash | CoreAPI unreachable or stale |
+| Orange triple flash | Authentication or board registration rejected |
+| Alternating purple/red | Invalid API response |
+| Cyan fast pulse | OTA update in progress |
+| Alternating cyan/red | OTA update failed |
+| Yellow breathing | No substations online |
+| Light green | One substation online (normal operation) |
+| Medium green | Two substations online |
+| Dark green | Three substations online |
+| Two green/red flashes | NFC tag accepted/rejected |
+| Periodic pink triple flash | PN532 unavailable |
+
+Network and OTA errors take priority over the substation indication. API
+transport/protocol failures are shown only after repeated failures or a stale
+connection, so a single transient request does not make the LED flicker.
