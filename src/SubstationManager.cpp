@@ -3,9 +3,12 @@
 #include "GameState.h"
 #include "StatusLedManager.h"
 
-HardwareSerial subSerial1(1);
+// USB CDC owns the diagnostic console, leaving all hardware UARTs available.
+// Keep SUB1 on UART0's native GPIO44/GPIO43 pair to avoid competing pin-matrix
+// ownership on the ESP32-S3 default console pins.
+HardwareSerial subSerial1(0);
 HardwareSerial subSerial2(2);
-HardwareSerial subSerial3(0);
+HardwareSerial subSerial3(1);
 
 const uint8_t hwTypeMap[DEVICE_COUNT] = {4, 6, 2, 1, 3, 5};
 int32_t lastSentValues[DEVICE_COUNT] = {-1, -1, -1, -1, -1, -1};
