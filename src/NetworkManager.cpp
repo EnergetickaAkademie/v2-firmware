@@ -341,6 +341,7 @@ void pollGameState() {
         if (http.getSize() == 0) {
             // An inactive game is represented by an empty legacy response.
             // Do not enter a blocking stream read or discard the last valid state.
+            setBuildingScanScenarioState(false, true);
             statusLedRecordApiSuccess();
             http.end();
             return;
@@ -382,6 +383,7 @@ void pollGameState() {
             Serial.println("[Net] /poll_binary body was incomplete or invalid; keeping previous state.");
             statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         } else {
+            setBuildingScanScenarioState(true, false);
             statusLedRecordApiSuccess();
         }
     } else {
@@ -591,6 +593,22 @@ SyncV2Result syncBoardV2() {
         nextConsumption[i] = static_cast<uint32_t>(value / 1000);
     }
     memcpy(nextCounts, response + offset, sizeof(nextCounts));
+
+    const bool gameActive = (flags & 0x01) != 0;
+    bool allBuildingCountsZero = true;
+    for (size_t i = 0; i < BUILDING_COUNT; ++i) {
+        if (nextCounts[i] != 0) {
+            allBuildingCountsZero = false;
+            break;
+        }
+    }
+
+    // An inactive response is an explicit scenario boundary. The zero-count
+    // fallback handles a fast restart where the board misses that response.
+    const bool resetScanCache =
+        !gameActive ||
+        (configRevision != lastConfigRevision && allBuildingCountsZero);
+    setBuildingScanScenarioState(gameActive, resetScanCache);
 
     memcpy(currentCoefficient, nextCoefficients, sizeof(nextCoefficients));
     memcpy(baseMinMW, nextMin, sizeof(nextMin));

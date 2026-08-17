@@ -165,19 +165,6 @@ void nfcTaskImpl(void *pvParameters) {
 				uidStr += String(uid[i], HEX);
 			}
 
-			bool alreadyScanned = false;
-			for (const auto& b : scannedBuildings) {
-				if (b.uid == uidStr) {
-					alreadyScanned = true;
-					break;
-				}
-			}
-			if (alreadyScanned) {
-				Serial.println("[NFC] Already scanned, ignoring.");
-				vTaskDelay(pdMS_TO_TICKS(150));
-				continue;
-			}
-
 			uint8_t data[32] = {0};
 			bool readSuccess = false;
 
@@ -233,14 +220,26 @@ void nfcTaskImpl(void *pvParameters) {
 				}
 
 				if (formatFound && buildingType <= 0x11) {
-					scannedBuildings.push_back({uidStr, buildingType});
+					BuildingScanQueueResult queueResult =
+						queueBuildingScan(uidStr, buildingType);
 
-					if (pendingMutex != nullptr && xSemaphoreTake(pendingMutex, portMAX_DELAY) == pdTRUE) {
-						pendingBuildings.push_back({uidStr, buildingType});
-						xSemaphoreGive(pendingMutex);
-						Serial.println("[NFC] Queued building for server.");
+					if (queueResult == BuildingScanQueueResult::Duplicate) {
+						Serial.println("[NFC] Already scanned in this scenario, ignoring.");
+						vTaskDelay(pdMS_TO_TICKS(150));
+						continue;
+					}
+					if (queueResult == BuildingScanQueueResult::Inactive) {
+						Serial.println("[NFC] Scenario is inactive, ignoring tag.");
+						vTaskDelay(pdMS_TO_TICKS(150));
+						continue;
+					}
+					if (queueResult == BuildingScanQueueResult::Unavailable) {
+						Serial.println("[NFC] Scan queue is unavailable, ignoring tag.");
+						vTaskDelay(pdMS_TO_TICKS(150));
+						continue;
 					}
 
+					Serial.println("[NFC] Queued building for server.");
 					Serial.printf("[NFC] SUCCESS! UID: %s | Type: 0x%02X | Queued for server.\n",
 								  uidStr.c_str(), buildingType);
 					statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);

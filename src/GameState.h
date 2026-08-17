@@ -38,4 +38,14 @@ struct PendingBuilding {
 extern std::vector<PendingBuilding> pendingBuildings;
 extern SemaphoreHandle_t pendingMutex;
 
+enum class BuildingScanQueueResult {
+	Queued,
+	Duplicate,
+	Inactive,
+	Unavailable,
+};
+
+BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type);
+void setBuildingScanScenarioState(bool active, bool resetCache);
+
 #endif
