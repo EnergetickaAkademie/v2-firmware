@@ -17,6 +17,7 @@ const unsigned long POST_INTERVAL = 1000;
 
 namespace {
 constexpr uint32_t STREAM_READ_TIMEOUT_MS = 3000;
+bool boardRegistered = false;
 
 bool readExact(WiFiClient* stream, uint8_t* buffer, size_t length) {
     if (!stream || !buffer) return false;
@@ -53,9 +54,31 @@ bool handleAuthFailure(int httpCode, const char* endpoint) {
         Serial.printf("[Net] %s rejected token (HTTP %d); re-authentication required.\n",
                       endpoint, httpCode);
         jwtToken = "";
+        boardRegistered = false;
         return true;
     }
     return false;
+}
+
+bool handleBoardNotFound(HTTPClient& http, int httpCode, const char* endpoint) {
+    if (httpCode != HTTP_CODE_NOT_FOUND) return false;
+
+    String body = http.getString();
+    body.trim();
+    if (body != "BOARD_NOT_FOUND") return false;
+
+    Serial.printf("[Net] %s no longer recognizes this board; re-registration required.\n",
+                  endpoint);
+    boardRegistered = false;
+    return true;
+}
+
+void writeBE32(uint8_t* destination, int32_t value) {
+    uint32_t raw = static_cast<uint32_t>(value);
+    destination[0] = static_cast<uint8_t>(raw >> 24);
+    destination[1] = static_cast<uint8_t>(raw >> 16);
+    destination[2] = static_cast<uint8_t>(raw >> 8);
+    destination[3] = static_cast<uint8_t>(raw);
 }
 
 void logHttpFailure(const char* endpoint, int httpCode) {
@@ -218,6 +241,7 @@ bool registerBoard() {
 
         if (readExact(stream, response, sizeof(response)) && response[0] == 1) {
             Serial.println("[Net] Board binary registration successful!");
+            boardRegistered = true;
             success = true;
         } else {
             Serial.println("[Net] Registration response was incomplete or invalid.");
@@ -230,6 +254,7 @@ bool registerBoard() {
         // Preserve the existing behavior of forcing a fresh login after
         // registration failure, including malformed/incomplete 200 responses.
         jwtToken = "";
+        boardRegistered = false;
     }
 
     http.end();
@@ -245,6 +270,13 @@ void pollGameState() {
 
     int httpCode = http.GET();
     if (httpCode == HTTP_CODE_OK) {
+        if (http.getSize() == 0) {
+            // An inactive game is represented by an empty legacy response.
+            // Do not enter a blocking stream read or discard the last valid state.
+            http.end();
+            return;
+        }
+
         WiFiClient* stream = http.getStreamPtr();
         uint8_t prodCount = 0;
 
@@ -281,7 +313,8 @@ void pollGameState() {
             Serial.println("[Net] /poll_binary body was incomplete or invalid; keeping previous state.");
         }
     } else {
-        if (!handleAuthFailure(httpCode, "/poll_binary")) {
+        if (!handleAuthFailure(httpCode, "/poll_binary") &&
+            !handleBoardNotFound(http, httpCode, "/poll_binary")) {
             logHttpFailure("/poll_binary", httpCode);
         }
     }
@@ -326,7 +359,8 @@ void pollProductionRanges() {
             Serial.println("[Net] /prod_vals body was incomplete or invalid.");
         }
     } else {
-        if (!handleAuthFailure(httpCode, "/prod_vals")) {
+        if (!handleAuthFailure(httpCode, "/prod_vals") &&
+            !handleBoardNotFound(http, httpCode, "/prod_vals")) {
             logHttpFailure("/prod_vals", httpCode);
         }
     }
@@ -368,7 +402,8 @@ void pollConsumptionValues() {
             Serial.println("[Net] /cons_vals body was incomplete or invalid.");
         }
     } else {
-        if (!handleAuthFailure(httpCode, "/cons_vals")) {
+        if (!handleAuthFailure(httpCode, "/cons_vals") &&
+            !handleBoardNotFound(http, httpCode, "/cons_vals")) {
             logHttpFailure("/cons_vals", httpCode);
         }
     }
@@ -386,19 +421,15 @@ void postTelemetry() {
 
     uint8_t payload[8];
 
-    payload[0] = (currentTotalProduction_MW >> 24) & 0xFF;
-    payload[1] = (currentTotalProduction_MW >> 16) & 0xFF;
-    payload[2] = (currentTotalProduction_MW >> 8) & 0xFF;
-    payload[3] = currentTotalProduction_MW & 0xFF;
-
-    payload[4] = (currentTotalConsumption_MW >> 24) & 0xFF;
-    payload[5] = (currentTotalConsumption_MW >> 16) & 0xFF;
-    payload[6] = (currentTotalConsumption_MW >> 8) & 0xFF;
-    payload[7] = currentTotalConsumption_MW & 0xFF;
+    // Convert to the unsigned bit representation before shifting so negative
+    // values (for example battery charging) are serialized portably.
+    writeBE32(payload, currentTotalProduction_MW);
+    writeBE32(payload + 4, currentTotalConsumption_MW);
 
     int httpCode = http.POST(payload, sizeof(payload));
     if (httpCode < 200 || httpCode >= 300) {
-        if (!handleAuthFailure(httpCode, "/post_vals")) {
+        if (!handleAuthFailure(httpCode, "/post_vals") &&
+            !handleBoardNotFound(http, httpCode, "/post_vals")) {
             logHttpFailure("/post_vals", httpCode);
         }
     }
@@ -431,6 +462,16 @@ void networkTaskImpl(void *pvParameters) {
                 if (authenticate()) {
                     registerBoard();
                 }
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (!boardRegistered) {
+            if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
+                lastNetworkRetry = now;
+                Serial.println("[Net] Attempting board re-registration...");
+                registerBoard();
             }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -486,7 +527,8 @@ bool sendAddBuilding(uint8_t type, const String& uid) {
     bool success = code >= 200 && code < 300;
 
     if (!success) {
-        if (!handleAuthFailure(code, "/board/add_building")) {
+        if (!handleAuthFailure(code, "/board/add_building") &&
+            !handleBoardNotFound(http, code, "/board/add_building")) {
             logHttpFailure("/board/add_building", code);
         }
     } else {
@@ -515,7 +557,8 @@ void pollBuildingCounts() {
             Serial.println("[Net] /board/get_counts body was incomplete.");
         }
     } else {
-        if (!handleAuthFailure(code, "/board/get_counts")) {
+        if (!handleAuthFailure(code, "/board/get_counts") &&
+            !handleBoardNotFound(http, code, "/board/get_counts")) {
             logHttpFailure("/board/get_counts", code);
         }
     }
