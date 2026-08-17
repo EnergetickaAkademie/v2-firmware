@@ -49,10 +49,10 @@
 #define STATUS_RGB_LED_PIN 7
 #define STATUS_RGB_LED_BRIGHTNESS 48
 
-#define SUB1_RX_PIN 43
-#define SUB1_TX_PIN 44
-#define SUB2_RX_PIN 17
-#define SUB2_TX_PIN 18
+#define SUB1_RX_PIN 44
+#define SUB1_TX_PIN 43
+#define SUB2_RX_PIN 18
+#define SUB2_TX_PIN 17
 #define SUB3_RX_PIN 9
 #define SUB3_TX_PIN 8
 
