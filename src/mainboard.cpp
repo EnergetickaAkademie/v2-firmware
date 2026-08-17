@@ -317,8 +317,8 @@ void setup() {
 		buttons.push_back(factory.createShiftButton(inChain, buttonRegisterIndex[i], buttonBitPosition[i], true));
 	}
 
-	productionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
 	consumptionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
+	productionDisp = factory.createSegmentDisplay(outChain, DISPLAY_DIGIT_COUNT);
 
 	Bargraph* bg5 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);
 	Bargraph* bg4 = factory.createBargraph(outChain, BARGRAPH_LED_COUNT);

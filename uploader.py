@@ -307,8 +307,12 @@ class PowerplantManager(QWidget):
 
 	def update_upload_method_ui(self):
 		is_ota = self.upload_method_combo.currentText() == "Wi-Fi OTA"
-		for widget in (self.ota_host_input, self.ota_port_input, self.ota_password_input):
+
+		for widget in (self.ota_host_input, self.ota_port_input):
 			widget.setEnabled(is_ota)
+
+		self.ota_password_input.setEnabled(True)
+
 		if hasattr(self, "port_combo"):
 			self.port_combo.setEnabled(not is_ota)
 			self.refresh_ports_btn.setEnabled(not is_ota)
