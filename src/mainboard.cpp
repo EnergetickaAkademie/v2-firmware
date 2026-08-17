@@ -267,6 +267,8 @@ void startNfcTask() {
 
 void setup() {
 	Serial.begin(115200);
+	// Keep ESP-IDF/Arduino core logs on USB Serial/JTAG instead of UART0.
+	Serial.setDebugOutput(true);
 	statusLedSetup();
 	delay(1000);
 
