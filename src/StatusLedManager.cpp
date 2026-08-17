@@ -1,7 +1,5 @@
 #include "StatusLedManager.h"
 
-#include <Adafruit_NeoPixel.h>
-
 #include "Config.h"
 
 namespace {
@@ -49,7 +47,8 @@ struct SharedStatus {
     StatusNfcEvent nfcEvent = StatusNfcEvent::None;
 };
 
-Adafruit_NeoPixel statusPixel(1, STATUS_RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+constexpr uint32_t LED_FRAME_INTERVAL_MS = 20;
+uint32_t lastFrameMs = 0;
 portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 SharedStatus sharedStatus;
 uint32_t setupStartedAtMs = 0;
@@ -96,8 +95,8 @@ void render(Color color) {
     }
 
     lastRendered = color;
-    statusPixel.setPixelColor(0, statusPixel.Color(color.red, color.green, color.blue));
-    statusPixel.show();
+    const Color output = scaled(color, STATUS_RGB_LED_BRIGHTNESS);
+    neopixelWrite(STATUS_RGB_LED_PIN, output.red, output.green, output.blue);
 }
 
 SharedStatus snapshotStatus() {
@@ -110,15 +109,16 @@ SharedStatus snapshotStatus() {
 
 void statusLedSetup() {
     setupStartedAtMs = millis();
-    statusPixel.begin();
-    statusPixel.setBrightness(STATUS_RGB_LED_BRIGHTNESS);
-    statusPixel.clear();
-    statusPixel.show();
     render(WHITE);
 }
 
 void statusLedUpdate() {
     const uint32_t now = millis();
+    if (now - lastFrameMs < LED_FRAME_INTERVAL_MS) {
+        return;
+    }
+    lastFrameMs = now;
+
     const SharedStatus status = snapshotStatus();
 
     if (status.otaState == StatusOtaState::Uploading) {
