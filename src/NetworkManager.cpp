@@ -14,10 +14,25 @@ unsigned long lastPollMs = 0;
 const unsigned long POLL_INTERVAL = 2000;
 unsigned long lastPostMs = 0;
 const unsigned long POST_INTERVAL = 1000;
+unsigned long lastSyncMs = 0;
+const unsigned long SYNC_INTERVAL = 500;
 
 namespace {
 constexpr uint32_t STREAM_READ_TIMEOUT_MS = 3000;
+constexpr size_t SYNC_V2_REQUEST_SIZE = 52;
+constexpr size_t SYNC_V2_RESPONSE_SIZE = 210;
+constexpr uint32_t SYNC_V2_RETRY_INTERVAL_MS = 60000;
 bool boardRegistered = false;
+bool syncV2Available = true;
+uint32_t syncV2RetryAt = 0;
+uint32_t syncSequence = 0;
+uint32_t lastConfigRevision = 0;
+
+enum class SyncV2Result {
+    Success,
+    NotSupported,
+    Failed,
+};
 
 bool readExact(WiFiClient* stream, uint8_t* buffer, size_t length) {
     if (!stream || !buffer) return false;
@@ -73,12 +88,26 @@ bool handleBoardNotFound(HTTPClient& http, int httpCode, const char* endpoint) {
     return true;
 }
 
-void writeBE32(uint8_t* destination, int32_t value) {
-    uint32_t raw = static_cast<uint32_t>(value);
+void writeBEU32(uint8_t* destination, uint32_t raw) {
     destination[0] = static_cast<uint8_t>(raw >> 24);
     destination[1] = static_cast<uint8_t>(raw >> 16);
     destination[2] = static_cast<uint8_t>(raw >> 8);
     destination[3] = static_cast<uint8_t>(raw);
+}
+
+void writeBE32(uint8_t* destination, int32_t value) {
+    writeBEU32(destination, static_cast<uint32_t>(value));
+}
+
+uint32_t readBEU32(const uint8_t* source) {
+    return (static_cast<uint32_t>(source[0]) << 24) |
+           (static_cast<uint32_t>(source[1]) << 16) |
+           (static_cast<uint32_t>(source[2]) << 8) |
+           static_cast<uint32_t>(source[3]);
+}
+
+int32_t readBE32(const uint8_t* source) {
+    return static_cast<int32_t>(readBEU32(source));
 }
 
 void logHttpFailure(const char* endpoint, int httpCode) {
@@ -411,6 +440,117 @@ void pollConsumptionValues() {
     http.end();
 }
 
+SyncV2Result syncBoardV2() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED || !boardRegistered) {
+        return SyncV2Result::Failed;
+    }
+
+    const uint32_t sequence = ++syncSequence;
+    uint8_t requestBody[SYNC_V2_REQUEST_SIZE] = {0};
+    requestBody[0] = 'E';
+    requestBody[1] = 'A';
+    requestBody[2] = 2;
+    requestBody[3] = 0;
+    writeBEU32(requestBody + 4, sequence);
+    writeBE32(requestBody + 8, currentTotalProduction_MW);
+    writeBE32(requestBody + 12, currentTotalConsumption_MW);
+    for (size_t sourceId = 0; sourceId < 9; ++sourceId) {
+        writeBE32(requestBody + 16 + sourceId * 4, productionByTypeMW[sourceId]);
+    }
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/board/sync/v2");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    http.addHeader("Content-Type", "application/octet-stream");
+
+    int httpCode = http.POST(requestBody, sizeof(requestBody));
+    if (httpCode == HTTP_CODE_NOT_FOUND) {
+        String body = http.getString();
+        body.trim();
+        if (body == "BOARD_NOT_FOUND") {
+            Serial.println("[Net] /board/sync/v2 requires board re-registration.");
+            boardRegistered = false;
+            http.end();
+            return SyncV2Result::Failed;
+        }
+
+        Serial.println("[Net] /board/sync/v2 is unavailable; temporarily using legacy endpoints.");
+        http.end();
+        return SyncV2Result::NotSupported;
+    }
+
+    if (httpCode != HTTP_CODE_OK) {
+        if (!handleAuthFailure(httpCode, "/board/sync/v2")) {
+            logHttpFailure("/board/sync/v2", httpCode);
+        }
+        http.end();
+        return SyncV2Result::Failed;
+    }
+
+    int responseSize = http.getSize();
+    if (responseSize >= 0 && responseSize != static_cast<int>(SYNC_V2_RESPONSE_SIZE)) {
+        Serial.printf("[Net] /board/sync/v2 invalid response size: %d\n", responseSize);
+        http.end();
+        return SyncV2Result::Failed;
+    }
+
+    uint8_t response[SYNC_V2_RESPONSE_SIZE];
+    if (!readExact(http.getStreamPtr(), response, sizeof(response))) {
+        http.end();
+        return SyncV2Result::Failed;
+    }
+    http.end();
+
+    uint8_t flags = response[3];
+    uint32_t echoedSequence = readBEU32(response + 4);
+    if (response[0] != 'E' || response[1] != 'A' || response[2] != 2 ||
+        (flags & ~0x01) != 0 || echoedSequence != sequence) {
+        Serial.println("[Net] /board/sync/v2 invalid header or sequence.");
+        return SyncV2Result::Failed;
+    }
+
+    uint32_t configRevision = readBEU32(response + 8);
+    size_t offset = 12;
+    float nextCoefficients[9];
+    int32_t nextMin[9];
+    int32_t nextMax[9];
+    uint32_t nextConsumption[BUILDING_COUNT];
+    uint8_t nextCounts[BUILDING_COUNT];
+
+    for (size_t i = 0; i < 9; ++i, offset += 4) {
+        nextCoefficients[i] = readBE32(response + offset) / 1000.0f;
+    }
+    for (size_t i = 0; i < 9; ++i, offset += 4) {
+        nextMin[i] = readBE32(response + offset) / 1000;
+    }
+    for (size_t i = 0; i < 9; ++i, offset += 4) {
+        nextMax[i] = readBE32(response + offset) / 1000;
+    }
+    for (size_t i = 0; i < BUILDING_COUNT; ++i, offset += 4) {
+        int32_t value = readBE32(response + offset);
+        if (value < 0) {
+            Serial.println("[Net] /board/sync/v2 rejected negative building consumption.");
+            return SyncV2Result::Failed;
+        }
+        nextConsumption[i] = static_cast<uint32_t>(value / 1000);
+    }
+    memcpy(nextCounts, response + offset, sizeof(nextCounts));
+
+    memcpy(currentCoefficient, nextCoefficients, sizeof(nextCoefficients));
+    memcpy(baseMinMW, nextMin, sizeof(nextMin));
+    memcpy(baseMaxMW, nextMax, sizeof(nextMax));
+    memcpy(buildingConsumptionMW, nextConsumption, sizeof(nextConsumption));
+    memcpy(authoritativeBuildingCounts, nextCounts, sizeof(nextCounts));
+
+    if (configRevision != lastConfigRevision) {
+        Serial.printf("[Net] Applied sync v2 config revision %u (%s).\n",
+                      static_cast<unsigned>(configRevision),
+                      (flags & 0x01) ? "active" : "inactive");
+        lastConfigRevision = configRevision;
+    }
+    return SyncV2Result::Success;
+}
+
 void postTelemetry() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
@@ -477,7 +617,22 @@ void networkTaskImpl(void *pvParameters) {
             continue;
         }
 
-        if (now - lastPollMs >= POLL_INTERVAL) {
+        bool useLegacyProtocol = !syncV2Available &&
+                                 static_cast<int32_t>(now - syncV2RetryAt) < 0;
+
+        if (!useLegacyProtocol && now - lastSyncMs >= SYNC_INTERVAL) {
+            lastSyncMs = now;
+            SyncV2Result result = syncBoardV2();
+            if (result == SyncV2Result::Success) {
+                syncV2Available = true;
+            } else if (result == SyncV2Result::NotSupported) {
+                syncV2Available = false;
+                syncV2RetryAt = now + SYNC_V2_RETRY_INTERVAL_MS;
+                useLegacyProtocol = true;
+            }
+        }
+
+        if (useLegacyProtocol && now - lastPollMs >= POLL_INTERVAL) {
             lastPollMs = now;
             pollGameState();
 
@@ -487,7 +642,7 @@ void networkTaskImpl(void *pvParameters) {
             if (jwtToken != "") pollBuildingCounts();
         }
 
-        if (jwtToken != "" && now - lastPostMs >= POST_INTERVAL) {
+        if (useLegacyProtocol && jwtToken != "" && now - lastPostMs >= POST_INTERVAL) {
             lastPostMs = now;
             postTelemetry();
         }
