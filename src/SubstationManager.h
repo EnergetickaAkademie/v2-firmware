@@ -11,4 +11,6 @@ void queueSubstationUpdates();
 
 void updateTotalCounts();
 
+uint8_t getOnlineSubstationCount();
+
 #endif

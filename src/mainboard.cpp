@@ -4,6 +4,7 @@
 #include "GameState.h"
 #include "NetworkManager.h"
 #include "OtaManager.h"
+#include "StatusLedManager.h"
 #include "SubstationManager.h"
 #include "PeripheralFactory.h"
 #include "BuildingTypes.h"
@@ -242,13 +243,16 @@ void nfcTaskImpl(void *pvParameters) {
 
 					Serial.printf("[NFC] SUCCESS! UID: %s | Type: 0x%02X | Queued for server.\n",
 								  uidStr.c_str(), buildingType);
+					statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
 					tone(BUZZER_PIN, 2000, 150);
 				} else {
 					Serial.println("[NFC] REJECTED. Valid NDEF format not found in memory.");
+					statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
 					tone(BUZZER_PIN, 300, 300);
 				}
 			} else {
 				Serial.printf("[NFC] REJECTED. Failed to read memory. UID length: %d\n", uidLength);
+				statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
 				tone(BUZZER_PIN, 100, 500);
 			}
 		}
@@ -263,6 +267,7 @@ void startNfcTask() {
 
 void setup() {
 	Serial.begin(115200);
+	statusLedSetup();
 	delay(1000);
 
 	Serial.println("\n\n[Main] Booting ESP32-S3...");
@@ -279,7 +284,9 @@ void setup() {
 	uint32_t versiondata = nfc.getFirmwareVersion();
 	if (!versiondata) {
 		Serial.println("[NFC] PN532 board not found via I2C");
+		statusLedSetNfcAvailable(false);
 	} else {
+		statusLedSetNfcAvailable(true);
 		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n",
 			(versiondata>>24) & 0xFF, (versiondata>>16) & 0xFF, (versiondata>>8) & 0xFF);
 		nfc.SAMConfig();
@@ -349,6 +356,7 @@ void setup() {
 
 void loop() {
 	const uint32_t now = millis();
+	statusLedUpdate();
 	handleOta();
 
 	if (now - lastCountsUpdateMs >= 200) {
