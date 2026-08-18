@@ -13,6 +13,9 @@
 #include <PN532.h>
 #include <WiFi.h>
 #include <esp_system.h>
+#include "DebugLog.h"
+
+#define Serial DebugLog
 
 PeripheralFactory factory;
 ShiftRegisterChain* outChain = nullptr;
@@ -190,12 +193,18 @@ bool updateBargraphs() {
 void nfcTaskImpl(void *pvParameters) {
 	String presentedUid;
 	uint8_t consecutiveNoTagPolls = 0;
+	uint32_t noTagPolls = 0;
+	uint32_t lastHealthLogMs = millis();
+	uint32_t lastErrorLogMs = 0;
+	int16_t lastLoggedError = 0;
+
+	Serial.println("[NFC] Passive tag polling started.");
 
 	for (;;) {
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
 		uint8_t uidLength = 0;
 
-		if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
+		if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 500)) {
 			consecutiveNoTagPolls = 0;
 			Serial.println("[NFC] Tag detected!");
 
@@ -306,11 +315,31 @@ void nfcTaskImpl(void *pvParameters) {
 				tone(BUZZER_PIN, 100, 500);
 			}
 		} else {
+			++noTagPolls;
+			const int16_t transportError = pn532_i2c.getLastError();
+			const uint32_t now = millis();
+			if (transportError < 0 &&
+					(transportError != lastLoggedError || now - lastErrorLogMs >= 5000)) {
+				Serial.printf("[NFC] I2C polling error %d (transport errors: %lu).\n",
+						transportError,
+						static_cast<unsigned long>(pn532_i2c.getErrorCount()));
+				lastLoggedError = transportError;
+				lastErrorLogMs = now;
+			}
+
 			if (consecutiveNoTagPolls < 2) {
 				++consecutiveNoTagPolls;
 			}
 			if (consecutiveNoTagPolls >= 2) {
 				presentedUid = "";
+			}
+
+			if (now - lastHealthLogMs >= 30000) {
+				Serial.printf("[NFC] Polling health: %lu empty polls, %lu transport errors.\n",
+						static_cast<unsigned long>(noTagPolls),
+						static_cast<unsigned long>(pn532_i2c.getErrorCount()));
+				noTagPolls = 0;
+				lastHealthLogMs = now;
 			}
 		}
 
@@ -363,7 +392,20 @@ void setup() {
 		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n",
 			(versiondata>>24) & 0xFF, (versiondata>>16) & 0xFF, (versiondata>>8) & 0xFF);
 		if (nfc.SAMConfig()) {
-			startNfcTask();
+			bool retriesConfigured = false;
+			for (uint8_t attempt = 1; attempt <= 3 && !retriesConfigured; ++attempt) {
+				retriesConfigured = nfc.setPassiveActivationRetries(0x01);
+				if (!retriesConfigured && attempt < 3) delay(50);
+			}
+
+			if (retriesConfigured) {
+				Serial.println("[NFC] Passive activation retries configured.");
+				startNfcTask();
+			} else {
+				Serial.printf("[NFC] Failed to configure passive polling (I2C error %d).\n",
+						pn532_i2c.getLastError());
+				statusLedSetNfcAvailable(false);
+			}
 		} else {
 			Serial.println("[NFC] Failed to configure PN532 SAM mode.");
 			statusLedSetNfcAvailable(false);

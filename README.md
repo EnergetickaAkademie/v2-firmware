@@ -13,6 +13,12 @@ Notes: for testing, disconnect WCHLink, or the CH32V003 won't respond to UART co
 
 The OTA password must contain at least eight characters. OTA updates apply only to the ESP32-S3 mainboard; CH32V003 powerplant and substation boards still require their wired programmer.
 
+The uploader can also inspect logs without flashing. Select **USB / serial** and
+click **Show serial**, or select **Wi-Fi OTA** and click **Show Wi-Fi log**. The
+Wi-Fi view uses the authenticated `/ota/log` endpoint and includes buffered
+application messages from boot, even if Wi-Fi connected later. The same OTA
+password protects firmware uploads and remote logs.
+
 ## Workshop v2 board sync
 
 The mainboard exchanges telemetry, production coefficients/ranges, building

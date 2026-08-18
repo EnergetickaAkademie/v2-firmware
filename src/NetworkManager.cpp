@@ -4,9 +4,12 @@
 #include <ArduinoJson.h>
 #include <vector>
 #include "Config.h"
+#include "DebugLog.h"
 #include "GameState.h"
 #include "OtaManager.h"
 #include "StatusLedManager.h"
+
+#define Serial DebugLog
 
 unsigned long lastNetworkRetry = 0;
 const unsigned long NETWORK_RETRY_INTERVAL = 5000;

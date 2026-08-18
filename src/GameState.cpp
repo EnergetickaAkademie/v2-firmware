@@ -1,4 +1,7 @@
 #include "GameState.h"
+#include "DebugLog.h"
+
+#define Serial DebugLog
 
 String jwtToken = "";
 int32_t currentTotalProduction_MW = 0;
