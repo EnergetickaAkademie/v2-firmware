@@ -1,7 +1,10 @@
 #include "SubstationManager.h"
+#include "DebugLog.h"
 #include "Config.h"
 #include "GameState.h"
 #include "StatusLedManager.h"
+
+#define Serial DebugLog
 
 // USB CDC owns the diagnostic console, leaving all hardware UARTs available.
 // Keep SUB1 on UART0's native GPIO44/GPIO43 pair to avoid competing pin-matrix

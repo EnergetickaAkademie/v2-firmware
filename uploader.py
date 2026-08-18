@@ -184,6 +184,68 @@ class PioMonitorThread(QThread):
 			except subprocess.TimeoutExpired:
 				self.process.kill()
 
+class WifiLogThread(QThread):
+	log_signal = pyqtSignal(str)
+
+	def __init__(self, host, port, password):
+		super().__init__()
+		self.host = host
+		self.port = port
+		self.password = password
+		self._stop_requested = False
+
+	def run(self):
+		url = f"http://{self.host}:{self.port}/ota/log"
+		headers = {"X-OTA-Password": self.password}
+		cursor = 0
+		pending = ""
+		connection_error_reported = False
+
+		self.log_signal.emit(f"--- Starting Wi-Fi log from {self.host}:{self.port} ---")
+
+		with requests.Session() as session:
+			while not self._stop_requested:
+				try:
+					response = session.get(
+						url,
+						headers=headers,
+						params={"since": cursor},
+						timeout=(1, 1.5),
+					)
+					if response.status_code == 401:
+						self.log_signal.emit("ERROR: Wi-Fi log authentication failed.")
+						return
+					response.raise_for_status()
+
+					if response.headers.get("X-Log-Dropped") == "1":
+						self.log_signal.emit("--- Log cursor reset or older messages were overwritten ---")
+					cursor = int(response.headers.get("X-Log-Cursor", cursor))
+					connection_error_reported = False
+
+					pending += response.text
+					lines = pending.splitlines(keepends=True)
+					pending = ""
+					for line in lines:
+						if line.endswith(("\n", "\r")):
+							self.log_signal.emit(line.rstrip("\r\n"))
+						else:
+							pending = line
+				except (requests.RequestException, ValueError) as exc:
+					if not connection_error_reported:
+						self.log_signal.emit(f"Wi-Fi log unavailable; retrying: {exc}")
+						connection_error_reported = True
+
+				for _ in range(5):
+					if self._stop_requested:
+						break
+					self.msleep(50)
+
+		if pending:
+			self.log_signal.emit(pending)
+
+	def stop(self):
+		self._stop_requested = True
+
 class PowerplantManager(QWidget):
 	def __init__(self):
 		super().__init__()
@@ -278,6 +340,10 @@ class PowerplantManager(QWidget):
 		self.monitor_checkbox = QCheckBox("Show serial output after upload")
 		layout.addWidget(self.monitor_checkbox)
 
+		self.monitor_btn = QPushButton("Show serial")
+		self.monitor_btn.clicked.connect(self.toggle_monitor)
+		layout.addWidget(self.monitor_btn)
+
 		self.output_text = QTextEdit()
 		self.output_text.setReadOnly(True)
 		# Monospaced font for build logs
@@ -298,6 +364,7 @@ class PowerplantManager(QWidget):
 		self.upload_btn.setText("Generate UID and Upload" if is_powerplant else "Upload Mainboard")
 		if not is_powerplant:
 			self.prefill_mainboard_fields()
+		self.update_upload_method_ui()
 
 	def on_show_passwords_toggled(self, checked):
 		mode = QLineEdit.Normal if checked else QLineEdit.Password
@@ -316,7 +383,50 @@ class PowerplantManager(QWidget):
 		if hasattr(self, "port_combo"):
 			self.port_combo.setEnabled(not is_ota)
 			self.refresh_ports_btn.setEnabled(not is_ota)
-			self.monitor_checkbox.setEnabled(not is_ota)
+			self.monitor_checkbox.setText("Show output after upload")
+			self.monitor_btn.setText("Stop log" if self.monitor_thread and self.monitor_thread.isRunning()
+				else ("Show Wi-Fi log" if is_ota else "Show serial"))
+
+	def stop_monitor(self):
+		if self.monitor_thread and self.monitor_thread.isRunning():
+			self.monitor_thread.stop()
+			self.monitor_thread.wait(3000)
+		self.monitor_thread = None
+		self.update_upload_method_ui()
+
+	def start_monitor(self, env_name=None):
+		self.stop_monitor()
+		is_mainboard = self.board_combo.currentText() == "Mainboard"
+		is_ota = is_mainboard and self.upload_method_combo.currentText() == "Wi-Fi OTA"
+
+		if is_ota:
+			host = self.ota_host_input.text().strip()
+			port_text = self.ota_port_input.text().strip()
+			password = self.ota_password_input.text().strip()
+			if not host or not port_text or not password:
+				self.log("ERROR: OTA host, port, and password are required for Wi-Fi logs.")
+				return
+			try:
+				port = int(port_text)
+			except ValueError:
+				self.log("ERROR: OTA port must be an integer.")
+				return
+			self.monitor_thread = WifiLogThread(host, port, password)
+		else:
+			if env_name is None:
+				env_name = "mainboard" if is_mainboard else "powerplant"
+			self.monitor_thread = PioMonitorThread(env_name, self.get_selected_port())
+
+		self.monitor_thread.log_signal.connect(self.log)
+		self.monitor_thread.finished.connect(self.update_upload_method_ui)
+		self.monitor_thread.start()
+		self.monitor_btn.setText("Stop log")
+
+	def toggle_monitor(self):
+		if self.monitor_thread and self.monitor_thread.isRunning():
+			self.stop_monitor()
+		else:
+			self.start_monitor()
 
 	def log(self, message):
 		self.output_text.append(message)
@@ -497,9 +607,8 @@ class PowerplantManager(QWidget):
 		selected_port = self.get_selected_port()
 
 		if self.monitor_thread and self.monitor_thread.isRunning():
-			self.log("--- Stopping serial monitor to free the port ---")
-			self.monitor_thread.stop()
-			self.monitor_thread.wait(3000)
+			self.log("--- Stopping active log monitor for upload ---")
+			self.stop_monitor()
 
 		if board_kind == "Powerplant":
 			selected_type = self.type_combo.currentText()
@@ -535,12 +644,12 @@ class PowerplantManager(QWidget):
 		self.upload_thread.log_signal.connect(self.log)
 		self.upload_thread.finished_signal.connect(
 			lambda success: self.on_upload_finished(
-				success, "mainboard", board_kind, can_monitor=not is_ota
+				success, "mainboard", board_kind
 			)
 		)
 		self.upload_thread.start()
 
-	def on_upload_finished(self, success, env_name, board_kind, hex_uid=None, selected_type=None, can_monitor=True):
+	def on_upload_finished(self, success, env_name, board_kind, hex_uid=None, selected_type=None):
 		self.upload_btn.setEnabled(True)
 		if success:
 			if board_kind == "Powerplant" and hex_uid and selected_type:
@@ -549,12 +658,8 @@ class PowerplantManager(QWidget):
 			else:
 				self.log("\nSUCCESS: Mainboard upload complete.")
 
-			if can_monitor and self.monitor_checkbox.isChecked():
-				if self.monitor_thread and self.monitor_thread.isRunning():
-					self.monitor_thread.stop()
-				self.monitor_thread = PioMonitorThread(env_name, self.get_selected_port())
-				self.monitor_thread.log_signal.connect(self.log)
-				self.monitor_thread.start()
+			if self.monitor_checkbox.isChecked():
+				self.start_monitor(env_name)
 		else:
 			if board_kind == "Powerplant":
 				self.log("\nFAILED: Upload aborted. UID not saved.")

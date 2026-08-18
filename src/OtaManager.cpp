@@ -7,13 +7,17 @@
 #include <WiFi.h>
 
 #include "Config.h"
+#include "DebugLog.h"
 #include "StatusLedManager.h"
+
+#define Serial DebugLog
 
 namespace {
 WebServer otaServer(OTA_PORT);
 
 constexpr char OTA_PATH[] = "/ota/firmware";
 constexpr char STATUS_PATH[] = "/ota/status";
+constexpr char LOG_PATH[] = "/ota/log";
 constexpr char AUTH_HEADER[] = "X-OTA-Password";
 
 bool serverStarted = false;
@@ -44,8 +48,32 @@ void handleStatus() {
     body += WiFi.localIP().toString();
     body += "\",\"update_in_progress\":";
     body += updateInProgress ? "true" : "false";
+    body += ",\"log_cursor\":";
+    body += String(DebugLog.cursor());
     body += "}";
     sendJson(200, body);
+}
+
+void handleLog() {
+    if (!isAuthorized()) {
+        sendJson(401, "{\"error\":\"unauthorized\"}");
+        return;
+    }
+
+    uint32_t since = 0;
+    if (otaServer.hasArg("since")) {
+        since = static_cast<uint32_t>(strtoul(otaServer.arg("since").c_str(), nullptr, 10));
+    }
+
+    String body;
+    uint32_t nextCursor = since;
+    bool dropped = false;
+    DebugLog.readSince(since, body, nextCursor, dropped);
+
+    otaServer.sendHeader("Cache-Control", "no-store");
+    otaServer.sendHeader("X-Log-Cursor", String(nextCursor));
+    otaServer.sendHeader("X-Log-Dropped", dropped ? "1" : "0");
+    otaServer.send(200, "text/plain; charset=utf-8", body);
 }
 
 void handleUploadFinished() {
@@ -137,6 +165,7 @@ void startServer() {
     otaServer.collectHeaders(headers, 1);
 
     otaServer.on(STATUS_PATH, HTTP_GET, handleStatus);
+    otaServer.on(LOG_PATH, HTTP_GET, handleLog);
     otaServer.on(OTA_PATH, HTTP_POST, handleUploadFinished, handleUploadChunk);
     otaServer.onNotFound([]() {
         sendJson(404, "{\"error\":\"not_found\"}");
