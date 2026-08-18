@@ -195,42 +195,69 @@ class WifiLogThread(QThread):
 		self._stop_requested = False
 
 	def run(self):
-		url = f"http://{self.host}:{self.port}/ota/log"
+		log_url = f"http://{self.host}:{self.port}/ota/log"
+		status_url = f"http://{self.host}:{self.port}/ota/status"
 		headers = {"X-OTA-Password": self.password}
 		cursor = 0
 		pending = ""
 		connection_error_reported = False
+		ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 		self.log_signal.emit(f"--- Starting Wi-Fi log from {self.host}:{self.port} ---")
 
 		with requests.Session() as session:
 			while not self._stop_requested:
 				try:
-					response = session.get(
-						url,
+					# Check the cursor using the non-empty status response. Calling
+					# /ota/log when nothing changed used to make WebServer emit a
+					# warning, which was then captured as the next remote log line.
+					status_response = session.get(
+						status_url,
 						headers=headers,
-						params={"since": cursor},
-						timeout=(1, 1.5),
+						timeout=(1, 2.5),
 					)
-					if response.status_code == 401:
-						self.log_signal.emit("ERROR: Wi-Fi log authentication failed.")
-						return
-					response.raise_for_status()
+					status_response.raise_for_status()
+					board_cursor = int(status_response.json().get("log_cursor", cursor))
 
-					if response.headers.get("X-Log-Dropped") == "1":
-						self.log_signal.emit("--- Log cursor reset or older messages were overwritten ---")
-					cursor = int(response.headers.get("X-Log-Cursor", cursor))
+					if board_cursor != cursor:
+						response = session.get(
+							log_url,
+							headers=headers,
+							params={"since": cursor},
+							timeout=(1, 2.5),
+						)
+						if response.status_code == 401:
+							self.log_signal.emit("ERROR: Wi-Fi log authentication failed.")
+							return
+						response.raise_for_status()
+
+						dropped = response.headers.get("X-Log-Dropped") == "1"
+						chunk_start = int(response.headers.get("X-Log-Start", cursor))
+						cursor = int(response.headers.get("X-Log-Cursor", cursor))
+						is_empty = response.headers.get("X-Log-Empty") == "1"
+
+						text_chunk = "" if is_empty else ansi_escape.sub("", response.text)
+						if dropped:
+							self.log_signal.emit(
+								"--- Board rebooted or older log messages were overwritten ---"
+							)
+							pending = ""
+							# A wrapped ring buffer can begin in the middle of a line.
+							if chunk_start > 0:
+								newline = text_chunk.find("\n")
+								text_chunk = text_chunk[newline + 1:] if newline >= 0 else ""
+
+						pending += text_chunk
+						lines = pending.splitlines(keepends=True)
+						pending = ""
+						for line in lines:
+							if line.endswith(("\n", "\r")):
+								self.log_signal.emit(line.rstrip("\r\n"))
+							else:
+								pending = line
+
 					connection_error_reported = False
-
-					pending += response.text
-					lines = pending.splitlines(keepends=True)
-					pending = ""
-					for line in lines:
-						if line.endswith(("\n", "\r")):
-							self.log_signal.emit(line.rstrip("\r\n"))
-						else:
-							pending = line
-				except (requests.RequestException, ValueError) as exc:
+				except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
 					if not connection_error_reported:
 						self.log_signal.emit(f"Wi-Fi log unavailable; retrying: {exc}")
 						connection_error_reported = True
