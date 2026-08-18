@@ -57,6 +57,24 @@ BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type) {
 	return result;
 }
 
+bool hasBuildingBeenScanned(const String& uid) {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return false;
+	}
+
+	bool duplicate = false;
+	for (const auto& building : scannedBuildings) {
+		if (building.uid == uid) {
+			duplicate = true;
+			break;
+		}
+	}
+
+	xSemaphoreGive(pendingMutex);
+	return duplicate;
+}
+
 void setBuildingScanScenarioState(bool active, bool resetCache) {
 	if (pendingMutex == nullptr ||
 		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
