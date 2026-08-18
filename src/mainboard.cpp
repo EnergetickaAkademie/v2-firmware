@@ -62,6 +62,198 @@ const char* resetReasonName(esp_reset_reason_t reason) {
 	}
 }
 
+namespace {
+constexpr size_t NTAG213_USER_BYTES = 144;
+constexpr size_t INITIAL_NDEF_READ_BYTES = 32;
+constexpr uint32_t RESET_HOLD_MS = 2000;
+constexpr uint8_t ADMIN_RECORD_VERSION = 1;
+constexpr uint8_t ADMIN_COMMAND_RESET_BUILDINGS = 1;
+
+struct NdefRecordView {
+	const uint8_t* type = nullptr;
+	size_t typeLength = 0;
+	const uint8_t* payload = nullptr;
+	size_t payloadLength = 0;
+};
+
+uint32_t crc32(const uint8_t* data, size_t length) {
+	uint32_t crc = 0xFFFFFFFFu;
+	for (size_t i = 0; i < length; ++i) {
+		crc ^= data[i];
+		for (uint8_t bit = 0; bit < 8; ++bit) {
+			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+		}
+	}
+	return crc ^ 0xFFFFFFFFu;
+}
+
+bool findNdefMessage(const uint8_t* data, size_t available,
+					 size_t& messageOffset, size_t& messageLength) {
+	size_t offset = 0;
+	while (offset < available) {
+		const uint8_t tag = data[offset++];
+		if (tag == 0x00) continue;
+		if (tag == 0xFE) return false;
+
+		if (offset >= available) return false;
+		size_t valueLength = 0;
+		if (data[offset] == 0xFF) {
+			if (offset + 2 >= available) return false;
+			valueLength = (static_cast<size_t>(data[offset + 1]) << 8) |
+						  data[offset + 2];
+			offset += 3;
+		} else {
+			valueLength = data[offset++];
+		}
+
+		if (tag == 0x03) {
+			messageOffset = offset;
+			messageLength = valueLength;
+			return messageOffset + messageLength <= NTAG213_USER_BYTES;
+		}
+
+		if (offset + valueLength > available) return false;
+		offset += valueLength;
+	}
+	return false;
+}
+
+bool parseFirstNdefRecord(const uint8_t* data, size_t dataLength,
+						  NdefRecordView& record) {
+	size_t messageOffset = 0;
+	size_t messageLength = 0;
+	if (!findNdefMessage(data, dataLength, messageOffset, messageLength) ||
+		messageOffset + messageLength > dataLength || messageLength < 3) {
+		return false;
+	}
+
+	const size_t messageEnd = messageOffset + messageLength;
+	size_t offset = messageOffset;
+	const uint8_t header = data[offset++];
+	if ((header & 0x20) != 0) return false;  // Chunked records are unsupported.
+	const bool shortRecord = (header & 0x10) != 0;
+	const bool hasId = (header & 0x08) != 0;
+	const uint8_t typeLength = data[offset++];
+
+	uint32_t payloadLength = 0;
+	if (shortRecord) {
+		if (offset >= messageEnd) return false;
+		payloadLength = data[offset++];
+	} else {
+		if (offset + 4 > messageEnd) return false;
+		payloadLength =
+			(static_cast<uint32_t>(data[offset]) << 24) |
+			(static_cast<uint32_t>(data[offset + 1]) << 16) |
+			(static_cast<uint32_t>(data[offset + 2]) << 8) |
+			static_cast<uint32_t>(data[offset + 3]);
+		offset += 4;
+	}
+
+	uint8_t idLength = 0;
+	if (hasId) {
+		if (offset >= messageEnd) return false;
+		idLength = data[offset++];
+	}
+	if (offset + typeLength + idLength + payloadLength > messageEnd) return false;
+
+	record.type = data + offset;
+	record.typeLength = typeLength;
+	offset += typeLength + idLength;
+	record.payload = data + offset;
+	record.payloadLength = payloadLength;
+	return true;
+}
+
+bool recordTypeEquals(const NdefRecordView& record, const char* expected) {
+	const size_t length = strlen(expected);
+	return record.typeLength == length &&
+		memcmp(record.type, expected, length) == 0;
+}
+
+bool readUltralightNdef(uint8_t* data, size_t& dataLength) {
+	memset(data, 0, NTAG213_USER_BYTES);
+	for (uint8_t page = 4; page < 12; ++page) {
+		if (!nfc.mifareultralight_ReadPage(
+				page, data + static_cast<size_t>(page - 4) * 4)) {
+			return false;
+		}
+	}
+	dataLength = INITIAL_NDEF_READ_BYTES;
+
+	size_t messageOffset = 0;
+	size_t messageLength = 0;
+	if (!findNdefMessage(data, dataLength, messageOffset, messageLength)) {
+		return true;  // Preserve legacy building-tag parsing.
+	}
+	const size_t required = messageOffset + messageLength;
+	if (required <= dataLength) {
+		dataLength = required;
+		return true;
+	}
+	if (required > NTAG213_USER_BYTES) return false;
+
+	const size_t requiredPages = (required + 3) / 4;
+	for (size_t pageIndex = INITIAL_NDEF_READ_BYTES / 4;
+		 pageIndex < requiredPages; ++pageIndex) {
+		const uint8_t page = static_cast<uint8_t>(4 + pageIndex);
+		if (!nfc.mifareultralight_ReadPage(page, data + pageIndex * 4)) {
+			return false;
+		}
+	}
+	dataLength = required;
+	return true;
+}
+
+bool parseWifiProvisioning(const NdefRecordView& record,
+						   String& ssid, String& password, uint8_t& security) {
+	if (record.payloadLength < 9 || record.payload[0] != ADMIN_RECORD_VERSION) {
+		return false;
+	}
+
+	security = record.payload[1];
+	const size_t ssidLength = record.payload[2];
+	size_t offset = 3;
+	if (ssidLength == 0 || ssidLength > 32 ||
+		offset + ssidLength + 1 + 4 > record.payloadLength) {
+		return false;
+	}
+
+	ssid = "";
+	ssid.reserve(ssidLength);
+	for (size_t i = 0; i < ssidLength; ++i) {
+		ssid += static_cast<char>(record.payload[offset + i]);
+	}
+	offset += ssidLength;
+
+	const size_t passwordLength = record.payload[offset++];
+	if (offset + passwordLength + 4 != record.payloadLength) return false;
+	password = "";
+	password.reserve(passwordLength);
+	for (size_t i = 0; i < passwordLength; ++i) {
+		password += static_cast<char>(record.payload[offset + i]);
+	}
+	offset += passwordLength;
+
+	const uint32_t expectedCrc =
+		(static_cast<uint32_t>(record.payload[offset]) << 24) |
+		(static_cast<uint32_t>(record.payload[offset + 1]) << 16) |
+		(static_cast<uint32_t>(record.payload[offset + 2]) << 8) |
+		static_cast<uint32_t>(record.payload[offset + 3]);
+	return crc32(record.payload, offset) == expectedCrc &&
+		security <= 1 &&
+		((security == 0 && passwordLength == 0) ||
+		 (security == 1 && passwordLength >= 8 && passwordLength <= 63));
+}
+
+void playResetConfirmedTone() {
+	const uint16_t frequencies[] = {1200, 1700, 2200};
+	for (uint16_t frequency : frequencies) {
+		tone(BUZZER_PIN, frequency, 90);
+		vTaskDelay(pdMS_TO_TICKS(120));
+	}
+}
+} // namespace
+
 void updateDisplays() {
 	int32_t combinedBatteryPump = productionByTypeMW[8] + productionByTypeMW[6];
 	int32_t combinedWindSolar = productionByTypeMW[2] + productionByTypeMW[1];
@@ -175,6 +367,9 @@ bool updateBargraphs() {
 
 void nfcTaskImpl(void *pvParameters) {
 	String presentedUid;
+	String resetArmedUid;
+	uint32_t resetArmedAtMs = 0;
+	bool resetExecuted = false;
 	uint8_t consecutiveNoTagPolls = 0;
 	uint32_t noTagPolls = 0;
 	uint32_t lastHealthLogMs = millis();
@@ -184,6 +379,11 @@ void nfcTaskImpl(void *pvParameters) {
 	Serial.println("[NFC] Passive tag polling started.");
 
 	for (;;) {
+		if (consumeBuildingResetAcknowledged()) {
+			Serial.println("[NFC] Server confirmed the building reset.");
+			tone(BUZZER_PIN, 2400, 350);
+		}
+
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
 		uint8_t uidLength = 0;
 
@@ -197,57 +397,97 @@ void nfcTaskImpl(void *pvParameters) {
 			}
 
 			if (uidStr == presentedUid) {
+				if (!resetExecuted && resetArmedUid == uidStr &&
+					millis() - resetArmedAtMs >= RESET_HOLD_MS) {
+					requestBuildingReset();
+					resetExecuted = true;
+					statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+					Serial.println("[NFC] Reset card hold confirmed; building state cleared.");
+					playResetConfirmedTone();
+				}
 				vTaskDelay(pdMS_TO_TICKS(100));
 				continue;
 			}
+			resetArmedUid = "";
+			resetArmedAtMs = 0;
+			resetExecuted = false;
 			presentedUid = uidStr;
 
-			if (hasBuildingBeenScanned(uidStr)) {
-				Serial.println("[NFC] Already scanned in this scenario, ignoring.");
-				vTaskDelay(pdMS_TO_TICKS(100));
-				continue;
-			}
-
-			uint8_t data[32] = {0};
+			uint8_t data[NTAG213_USER_BYTES] = {0};
+			size_t dataLength = 0;
 			bool readSuccess = false;
 
 			if (uidLength == 7) {
-				// The current PN532 library copies 4 bytes per Ultralight read.
-				// Read all eight pages needed to populate the same 32-byte
-				// buffer the existing parser already expects.
-				readSuccess = true;
-				for (uint8_t page = 4; page < 12; ++page) {
-					uint8_t* pageData = data + ((page - 4) * 4);
-					if (!nfc.mifareultralight_ReadPage(page, pageData)) {
-						readSuccess = false;
-						break;
-					}
-				}
+				readSuccess = readUltralightNdef(data, dataLength);
 			} else if (uidLength == 4) {
 				uint8_t keyNDEF[6]      = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
 				uint8_t keyUniversal[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 				if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNDEF)) {
-					if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
+					if (nfc.mifareclassic_ReadDataBlock(4, data)) {
+						readSuccess = true;
+						dataLength = 16;
+					}
 				}
 				else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
-					if (nfc.mifareclassic_ReadDataBlock(4, data)) readSuccess = true;
+					if (nfc.mifareclassic_ReadDataBlock(4, data)) {
+						readSuccess = true;
+						dataLength = 16;
+					}
 				}
 			}
 
 			if (readSuccess) {
-				// --- DIAGNOSTIC DUMP ---
-				Serial.print("[NFC] Read 32 bytes: ");
-				for(int d = 0; d < 32; d++) {
-					Serial.printf("%02X ", data[d]);
+				NdefRecordView record;
+				const bool ndefFound = parseFirstNdefRecord(data, dataLength, record);
+
+				if (ndefFound && recordTypeEquals(record, "cz.enak:cmd")) {
+					if (record.payloadLength == 2 &&
+						record.payload[0] == ADMIN_RECORD_VERSION &&
+						record.payload[1] == ADMIN_COMMAND_RESET_BUILDINGS) {
+						resetArmedUid = uidStr;
+						resetArmedAtMs = millis();
+						resetExecuted = false;
+						Serial.println("[NFC] Reset card recognized; hold it in place for two seconds.");
+						tone(BUZZER_PIN, 800, 100);
+					} else {
+						Serial.println("[NFC] Unsupported administrative command record.");
+						statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
+						tone(BUZZER_PIN, 300, 300);
+					}
+					continue;
 				}
-				Serial.println();
-				// -----------------------
+
+				if (ndefFound && recordTypeEquals(record, "cz.enak:wifi")) {
+					String ssid;
+					String password;
+					uint8_t security = 0;
+					if (parseWifiProvisioning(record, ssid, password, security) &&
+						queueWifiProvisioning(ssid, password, security)) {
+						Serial.printf("[NFC] WiFi provisioning accepted for SSID: %s\n", ssid.c_str());
+						statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+						tone(BUZZER_PIN, 1500, 100);
+						vTaskDelay(pdMS_TO_TICKS(130));
+						tone(BUZZER_PIN, 2100, 180);
+					} else {
+						Serial.println("[NFC] Invalid WiFi provisioning record.");
+						statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
+						tone(BUZZER_PIN, 300, 300);
+					}
+					continue;
+				}
 
 				bool formatFound = false;
 				uint8_t buildingType = 0;
+				if (ndefFound && recordTypeEquals(record, "B") &&
+					record.payloadLength >= 1) {
+					buildingType = record.payload[0];
+					formatFound = true;
+				}
 
-				for (int i = 0; i <= 32 - 4; i++) {
+				// Backwards-compatible parser for tags written by older NFCFlasher
+				// versions, including records with an empty Android ID field.
+				for (size_t i = 0; !formatFound && i + 4 <= dataLength; i++) {
 					// Check Standard: [Type Len=1] [Payload Len=1] [Type='B'] [Payload]
 					if (data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x42) {
 						buildingType = data[i+3];
@@ -255,7 +495,7 @@ void nfcTaskImpl(void *pvParameters) {
 						break;
 					}
 					// Check with ID Length inserted by Android: [Type Len=1] [Payload Len=1] [ID Len=0] [Type='B'] [Payload]
-					else if (i <= 32 - 5 && data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x00 && data[i+3] == 0x42) {
+					else if (i + 5 <= dataLength && data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x00 && data[i+3] == 0x42) {
 						buildingType = data[i+4];
 						formatFound = true;
 						break;
@@ -273,6 +513,13 @@ void nfcTaskImpl(void *pvParameters) {
 					}
 					if (queueResult == BuildingScanQueueResult::Inactive) {
 						Serial.println("[NFC] Scenario is inactive, ignoring tag.");
+						vTaskDelay(pdMS_TO_TICKS(150));
+						continue;
+					}
+					if (queueResult == BuildingScanQueueResult::ResetPending) {
+						Serial.println("[NFC] Building reset is still synchronizing; scan again after confirmation.");
+						statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
+						tone(BUZZER_PIN, 500, 180);
 						vTaskDelay(pdMS_TO_TICKS(150));
 						continue;
 					}
@@ -314,7 +561,14 @@ void nfcTaskImpl(void *pvParameters) {
 				++consecutiveNoTagPolls;
 			}
 			if (consecutiveNoTagPolls >= 2) {
+				if (resetArmedUid.length() > 0 && !resetExecuted) {
+					Serial.println("[NFC] Reset cancelled because the card was removed too soon.");
+					tone(BUZZER_PIN, 300, 160);
+				}
 				presentedUid = "";
+				resetArmedUid = "";
+				resetArmedAtMs = 0;
+				resetExecuted = false;
 			}
 
 			if (now - lastHealthLogMs >= 30000) {
@@ -355,6 +609,8 @@ void setup() {
 	}
 
 	pendingMutex = xSemaphoreCreateMutex();
+	initPersistentGameState();
+	initNetworkConfig();
 
 	nfc.begin();
 	Wire.setClock(100000);
@@ -496,7 +752,10 @@ void loop() {
 	int32_t sharedVal = encoderValuesMW[2];
 	productionByTypeMW[8] = sharedVal / 2;
 	productionByTypeMW[6] = sharedVal - productionByTypeMW[8];
-	totalProdThisCycle += sharedVal;
+	const int32_t storageConsumptionThisCycle = sharedVal < 0 ? -sharedVal : 0;
+	if (sharedVal > 0) {
+		totalProdThisCycle += sharedVal;
+	}
 
 	int32_t solarActiveMax = (int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
 	int32_t windActiveMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]);
@@ -514,7 +773,7 @@ void loop() {
 
 	currentTotalProduction_MW = totalProdThisCycle;
 
-	uint32_t totalConsThisCycle = 0;
+	int32_t totalConsThisCycle = storageConsumptionThisCycle;
 	for (int i = 0; i < BUILDING_COUNT; i++) {
 		totalConsThisCycle += authoritativeBuildingCounts[i] * buildingConsumptionMW[i];
 	}

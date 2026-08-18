@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <vector>
 #include "Config.h"
 #include "DebugLog.h"
@@ -26,11 +27,28 @@ constexpr uint32_t STREAM_READ_TIMEOUT_MS = 3000;
 constexpr size_t SYNC_V2_REQUEST_SIZE = 52;
 constexpr size_t SYNC_V2_RESPONSE_SIZE = 210;
 constexpr uint32_t SYNC_V2_RETRY_INTERVAL_MS = 60000;
+constexpr uint32_t WIFI_CANDIDATE_TIMEOUT_MS = 30000;
+constexpr uint32_t BUILDING_RESET_RETRY_MS = 2000;
 bool boardRegistered = false;
 bool syncV2Available = true;
 uint32_t syncV2RetryAt = 0;
 uint32_t syncSequence = 0;
 uint32_t lastConfigRevision = 0;
+
+Preferences wifiPreferences;
+SemaphoreHandle_t wifiConfigMutex = nullptr;
+bool wifiPreferencesReady = false;
+String activeWifiSsid = WIFI_SSID;
+String activeWifiPassword = WIFI_PASS;
+uint8_t activeWifiSecurity = 1;
+String candidateWifiSsid;
+String candidateWifiPassword;
+uint8_t candidateWifiSecurity = 1;
+bool candidateWifiPending = false;
+uint32_t candidateWifiGeneration = 0;
+bool candidateWifiAttemptActive = false;
+uint32_t candidateWifiAttemptGeneration = 0;
+uint32_t candidateWifiAttemptStartedAt = 0;
 
 enum class WiFiSetupPhase {
     Uninitialized,
@@ -47,6 +65,120 @@ enum class SyncV2Result {
     NotSupported,
     Failed,
 };
+
+void beginWifiConnection(const String& ssid, const String& password, uint8_t security) {
+    if (security == 0) {
+        WiFi.begin(ssid.c_str());
+    } else {
+        WiFi.begin(ssid.c_str(), password.c_str());
+    }
+}
+
+void clearAuthenticationState() {
+    jwtToken = "";
+    boardRegistered = false;
+    statusLedSetBoardRegistered(false);
+}
+
+bool readCandidateWifi(String& ssid, String& password, uint8_t& security,
+                       uint32_t& generation) {
+    if (wifiConfigMutex == nullptr ||
+        xSemaphoreTake(wifiConfigMutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    const bool pending = candidateWifiPending;
+    if (pending) {
+        ssid = candidateWifiSsid;
+        password = candidateWifiPassword;
+        security = candidateWifiSecurity;
+        generation = candidateWifiGeneration;
+    }
+    xSemaphoreGive(wifiConfigMutex);
+    return pending;
+}
+
+void startCandidateWifiAttempt(const String& ssid, const String& password,
+                               uint8_t security, uint32_t generation,
+                               uint32_t now) {
+    Serial.printf("[WiFi] Testing NFC-provisioned network: %s\n", ssid.c_str());
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, false);
+    beginWifiConnection(ssid, password, security);
+    clearAuthenticationState();
+    candidateWifiAttemptActive = true;
+    candidateWifiAttemptGeneration = generation;
+    candidateWifiAttemptStartedAt = now;
+    lastNetworkRetry = now;
+}
+
+bool processCandidateWifi(uint32_t now) {
+    String ssid;
+    String password;
+    uint8_t security = 1;
+    uint32_t generation = 0;
+    const bool pending = readCandidateWifi(ssid, password, security, generation);
+
+    if (!pending) {
+        candidateWifiAttemptActive = false;
+        return false;
+    }
+
+    if (!candidateWifiAttemptActive || generation != candidateWifiAttemptGeneration) {
+        startCandidateWifiAttempt(ssid, password, security, generation, now);
+        return true;
+    }
+
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
+        if (wifiConfigMutex != nullptr &&
+            xSemaphoreTake(wifiConfigMutex, portMAX_DELAY) == pdTRUE) {
+            if (candidateWifiPending &&
+                candidateWifiGeneration == candidateWifiAttemptGeneration) {
+                activeWifiSsid = candidateWifiSsid;
+                activeWifiPassword = candidateWifiPassword;
+                activeWifiSecurity = candidateWifiSecurity;
+                candidateWifiPending = false;
+                wifiPreferences.putString("ssid", activeWifiSsid);
+                wifiPreferences.putString("password", activeWifiPassword);
+                wifiPreferences.putUChar("security", activeWifiSecurity);
+                wifiPreferences.remove("candidate_ssid");
+                wifiPreferences.remove("candidate_pass");
+                wifiPreferences.remove("candidate_sec");
+                wifiPreferences.putBool("candidate", false);
+            }
+            xSemaphoreGive(wifiConfigMutex);
+        }
+        WiFi.setAutoReconnect(true);
+        candidateWifiAttemptActive = false;
+        Serial.printf("[WiFi] NFC-provisioned network confirmed and saved: %s\n",
+                      activeWifiSsid.c_str());
+        return false;
+    }
+
+    if (now - candidateWifiAttemptStartedAt < WIFI_CANDIDATE_TIMEOUT_MS) {
+        return true;
+    }
+
+    if (wifiConfigMutex != nullptr &&
+        xSemaphoreTake(wifiConfigMutex, portMAX_DELAY) == pdTRUE) {
+        if (candidateWifiGeneration == candidateWifiAttemptGeneration) {
+            candidateWifiPending = false;
+            wifiPreferences.remove("candidate_ssid");
+            wifiPreferences.remove("candidate_pass");
+            wifiPreferences.remove("candidate_sec");
+            wifiPreferences.putBool("candidate", false);
+        }
+        xSemaphoreGive(wifiConfigMutex);
+    }
+
+    Serial.printf("[WiFi] NFC-provisioned network failed; restoring: %s\n",
+                  activeWifiSsid.c_str());
+    WiFi.disconnect(false, false);
+    WiFi.setAutoReconnect(true);
+    beginWifiConnection(activeWifiSsid, activeWifiPassword, activeWifiSecurity);
+    candidateWifiAttemptActive = false;
+    lastNetworkRetry = now;
+    return true;
+}
 
 bool readExact(WiFiClient* stream, uint8_t* buffer, size_t length) {
     if (!stream || !buffer) return false;
@@ -169,6 +301,7 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void processPendingBuildingUpload(uint32_t now) {
     static uint32_t lastAttemptMs = 0;
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED || pendingMutex == nullptr) return;
+    if (isBuildingResetPending()) return;
     if (now - lastAttemptMs < 2000) return;
 
     PendingBuilding pending;
@@ -202,6 +335,34 @@ void processPendingBuildingUpload(uint32_t now) {
     Serial.println("[Net] Queued building confirmed by server.");
 }
 
+bool processPendingBuildingReset(uint32_t now) {
+    static uint32_t lastAttemptMs = 0;
+    if (!isBuildingResetPending()) return false;
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED || !boardRegistered) return true;
+    if (now - lastAttemptMs < BUILDING_RESET_RETRY_MS) return true;
+    lastAttemptMs = now;
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/board/reset_buildings");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    int code = http.POST("");
+    const bool success = code >= 200 && code < 300;
+    if (!success) {
+        if (!handleAuthFailure(code, "/board/reset_buildings") &&
+            !handleBoardNotFound(http, code, "/board/reset_buildings")) {
+            logHttpFailure("/board/reset_buildings", code);
+        }
+        http.end();
+        return true;
+    }
+
+    http.end();
+    markBuildingResetCompleted();
+    statusLedRecordApiSuccess();
+    Serial.println("[Net] Building reset confirmed by server.");
+    return false;
+}
+
 bool advanceWiFiSetup(uint32_t now) {
     if (wifiSetupPhase == WiFiSetupPhase::WaitingToPowerOff &&
         now - wifiSetupPhaseStartedAt >= 1000) {
@@ -217,8 +378,8 @@ bool advanceWiFiSetup(uint32_t now) {
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(true);
 
-        Serial.printf("[Net] Connecting to WiFi: %s\n", WIFI_SSID);
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        Serial.printf("[Net] Connecting to WiFi: %s\n", activeWifiSsid.c_str());
+        beginWifiConnection(activeWifiSsid, activeWifiPassword, activeWifiSecurity);
         lastNetworkRetry = now;
         wifiSetupPhase = WiFiSetupPhase::Ready;
     }
@@ -229,8 +390,68 @@ bool advanceWiFiSetup(uint32_t now) {
 
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
-    Serial.printf("[Net] Reconnecting to WiFi: %s\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("[Net] Reconnecting to WiFi: %s\n", activeWifiSsid.c_str());
+    beginWifiConnection(activeWifiSsid, activeWifiPassword, activeWifiSecurity);
+}
+
+void initNetworkConfig() {
+    wifiConfigMutex = xSemaphoreCreateMutex();
+    if (wifiConfigMutex == nullptr) {
+        Serial.println("[WiFi] Configuration lock unavailable; NFC provisioning disabled.");
+        return;
+    }
+    wifiPreferencesReady = wifiPreferences.begin("network", false);
+    if (!wifiPreferencesReady) {
+        Serial.println("[WiFi] Persistent configuration unavailable; using firmware defaults.");
+        return;
+    }
+
+    activeWifiSsid = wifiPreferences.getString("ssid", WIFI_SSID);
+    activeWifiPassword = wifiPreferences.getString("password", WIFI_PASS);
+    activeWifiSecurity = wifiPreferences.getUChar(
+        "security", activeWifiPassword.length() == 0 ? 0 : 1);
+
+    candidateWifiPending = wifiPreferences.getBool("candidate", false);
+    if (candidateWifiPending) {
+        candidateWifiSsid = wifiPreferences.getString("candidate_ssid", "");
+        candidateWifiPassword = wifiPreferences.getString("candidate_pass", "");
+        candidateWifiSecurity = wifiPreferences.getUChar("candidate_sec", 1);
+        if (candidateWifiSsid.length() == 0) {
+            candidateWifiPending = false;
+            wifiPreferences.putBool("candidate", false);
+        } else {
+            candidateWifiGeneration = 1;
+            Serial.println("[WiFi] Restored an interrupted NFC provisioning attempt.");
+        }
+    }
+
+    Serial.printf("[WiFi] Active network configuration: %s\n", activeWifiSsid.c_str());
+}
+
+bool queueWifiProvisioning(const String& ssid, const String& password, uint8_t security) {
+    if (ssid.length() == 0 || ssid.length() > 32 || security > 1 ||
+        (security == 0 && password.length() != 0) ||
+        (security == 1 && (password.length() < 8 || password.length() > 63)) ||
+        wifiConfigMutex == nullptr || !wifiPreferencesReady) {
+        return false;
+    }
+
+    if (xSemaphoreTake(wifiConfigMutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    candidateWifiSsid = ssid;
+    candidateWifiPassword = password;
+    candidateWifiSecurity = security;
+    candidateWifiPending = true;
+    ++candidateWifiGeneration;
+    wifiPreferences.putString("candidate_ssid", candidateWifiSsid);
+    wifiPreferences.putString("candidate_pass", candidateWifiPassword);
+    wifiPreferences.putUChar("candidate_sec", candidateWifiSecurity);
+    wifiPreferences.putBool("candidate", true);
+    xSemaphoreGive(wifiConfigMutex);
+
+    Serial.printf("[WiFi] NFC provisioning queued for SSID: %s\n", ssid.c_str());
+    return true;
 }
 
 void networkSetup() {
@@ -671,6 +892,11 @@ void networkTaskImpl(void *pvParameters) {
             continue;
         }
 
+        if (processCandidateWifi(now)) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         if (WiFi.status() != WL_CONNECTED) {
             statusLedSetWifiConnected(false);
             if (now - lastNetworkRetry >= NETWORK_RETRY_INTERVAL) {
@@ -702,6 +928,11 @@ void networkTaskImpl(void *pvParameters) {
                 registerBoard();
             }
             vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (processPendingBuildingReset(now)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
