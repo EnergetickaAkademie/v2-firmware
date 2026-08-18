@@ -35,33 +35,16 @@ uint32_t lastCountsUpdateMs = 0;
 uint32_t lastDisplaysUpdateMs = 0;
 uint32_t lastBargraphsUpdateMs = 0;
 bool ledState = false;
-TaskHandle_t peripheralRefreshTaskHandle = nullptr;
+hw_timer_t *displayTimer = nullptr;
 
 PN532_I2C pn532_i2c(Wire);
 PN532 nfc(pn532_i2c);
 
-void peripheralRefreshTaskImpl(void *pvParameters) {
-	(void)pvParameters;
-	TickType_t lastWakeTime = xTaskGetTickCount();
-	const TickType_t refreshPeriod = pdMS_TO_TICKS(1);
-
-	for (;;) {
-		factory.update();
-		vTaskDelayUntil(&lastWakeTime, refreshPeriod);
-	}
-}
-
-void startPeripheralRefreshTask() {
-	if (xTaskCreatePinnedToCore(
-			peripheralRefreshTaskImpl,
-			"PeripheralRefresh",
-			4096,
-			NULL,
-			2,
-			&peripheralRefreshTaskHandle,
-			1) != pdPASS) {
-		Serial.println("[Main] Failed to start peripheral refresh task.");
-	}
+// The shift-register display chain was designed and hardware-tested at a
+// deterministic 1 kHz cadence. GPIO 38 is deliberately not registered with
+// PeripheralFactory, so this path no longer reaches LED::update()/analogWrite().
+void IRAM_ATTR onDisplayTimer() {
+	factory.update();
 }
 
 const char* resetReasonName(esp_reset_reason_t reason) {
@@ -375,7 +358,7 @@ void setup() {
 
 	nfc.begin();
 	Wire.setClock(100000);
-	Wire.setTimeOut(50);
+	Wire.setTimeOut(200);
 	uint32_t versiondata = 0;
 	for (uint8_t attempt = 1; attempt <= 3 && !versiondata; ++attempt) {
 		versiondata = nfc.getFirmwareVersion();
@@ -391,25 +374,32 @@ void setup() {
 		statusLedSetNfcAvailable(true);
 		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n",
 			(versiondata>>24) & 0xFF, (versiondata>>16) & 0xFF, (versiondata>>8) & 0xFF);
-		if (nfc.SAMConfig()) {
-			bool retriesConfigured = false;
-			for (uint8_t attempt = 1; attempt <= 3 && !retriesConfigured; ++attempt) {
-				retriesConfigured = nfc.setPassiveActivationRetries(0x01);
-				if (!retriesConfigured && attempt < 3) delay(50);
-			}
-
-			if (retriesConfigured) {
-				Serial.println("[NFC] Passive activation retries configured.");
-				startNfcTask();
-			} else {
-				Serial.printf("[NFC] Failed to configure passive polling (I2C error %d).\n",
-						pn532_i2c.getLastError());
-				statusLedSetNfcAvailable(false);
-			}
-		} else {
-			Serial.println("[NFC] Failed to configure PN532 SAM mode.");
-			statusLedSetNfcAvailable(false);
+		bool samConfigured = false;
+		for (uint8_t attempt = 1; attempt <= 3 && !samConfigured; ++attempt) {
+			samConfigured = nfc.SAMConfig();
+			if (!samConfigured && attempt < 3) delay(100);
 		}
+		if (!samConfigured) {
+			// A busy PN532 can accept the command but miss the response deadline.
+			// The pre-regression firmware started polling in this state and the
+			// reader recovered on the next command, so do not disable NFC forever.
+			Serial.printf("[NFC] SAMConfig response not confirmed (I2C error %d); continuing.\n",
+					pn532_i2c.getLastError());
+		}
+
+		bool retriesConfigured = false;
+		for (uint8_t attempt = 1; attempt <= 3 && !retriesConfigured; ++attempt) {
+			retriesConfigured = nfc.setPassiveActivationRetries(0x01);
+			if (!retriesConfigured && attempt < 3) delay(100);
+		}
+		if (retriesConfigured) {
+			Serial.println("[NFC] Passive activation retries configured.");
+		} else {
+			Serial.printf("[NFC] Passive retry response not confirmed (I2C error %d); continuing.\n",
+					pn532_i2c.getLastError());
+		}
+
+		startNfcTask();
 	}
 
 	initSubstations();
@@ -465,7 +455,10 @@ void setup() {
 	gasDisplay = disp3.left();
 	windPvDisplay = disp3.right();
 
-	startPeripheralRefreshTask();
+	displayTimer = timerBegin(0, 80, true);
+	timerAttachInterrupt(displayTimer, &onDisplayTimer, false);
+	timerAlarmWrite(displayTimer, 1000, true);
+	timerAlarmEnable(displayTimer);
 }
 
 void loop() {
