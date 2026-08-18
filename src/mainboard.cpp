@@ -12,6 +12,7 @@
 #include <PN532_I2C.h>
 #include <PN532.h>
 #include <WiFi.h>
+#include <esp_system.h>
 
 PeripheralFactory factory;
 ShiftRegisterChain* outChain = nullptr;
@@ -26,19 +27,53 @@ SegmentDisplayPair::Half coalDisplay, hydroDisplay, gasDisplay, nuclearDisplay, 
 SegmentDisplay* consumptionDisp = nullptr;
 SegmentDisplay* productionDisp = nullptr;
 
-hw_timer_t *displayTimer = nullptr;
 uint32_t lastLedToggleMs = 0;
 uint32_t lastCountsUpdateMs = 0;
 uint32_t lastDisplaysUpdateMs = 0;
 uint32_t lastBargraphsUpdateMs = 0;
 bool ledState = false;
-LED* statusLed = nullptr;
+TaskHandle_t peripheralRefreshTaskHandle = nullptr;
 
 PN532_I2C pn532_i2c(Wire);
 PN532 nfc(pn532_i2c);
 
-void IRAM_ATTR onDisplayTimer() {
-	factory.update();
+void peripheralRefreshTaskImpl(void *pvParameters) {
+	(void)pvParameters;
+	TickType_t lastWakeTime = xTaskGetTickCount();
+	const TickType_t refreshPeriod = pdMS_TO_TICKS(1);
+
+	for (;;) {
+		factory.update();
+		vTaskDelayUntil(&lastWakeTime, refreshPeriod);
+	}
+}
+
+void startPeripheralRefreshTask() {
+	if (xTaskCreatePinnedToCore(
+			peripheralRefreshTaskImpl,
+			"PeripheralRefresh",
+			4096,
+			NULL,
+			2,
+			&peripheralRefreshTaskHandle,
+			1) != pdPASS) {
+		Serial.println("[Main] Failed to start peripheral refresh task.");
+	}
+}
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+	switch (reason) {
+		case ESP_RST_POWERON: return "power-on";
+		case ESP_RST_EXT: return "external";
+		case ESP_RST_SW: return "software";
+		case ESP_RST_PANIC: return "panic";
+		case ESP_RST_INT_WDT: return "interrupt-watchdog";
+		case ESP_RST_TASK_WDT: return "task-watchdog";
+		case ESP_RST_WDT: return "watchdog";
+		case ESP_RST_BROWNOUT: return "brownout";
+		case ESP_RST_SDIO: return "SDIO";
+		default: return "unknown";
+	}
 }
 
 void updateDisplays() {
@@ -153,16 +188,32 @@ bool updateBargraphs() {
 }
 
 void nfcTaskImpl(void *pvParameters) {
+	String presentedUid;
+	uint8_t consecutiveNoTagPolls = 0;
+
 	for (;;) {
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
 		uint8_t uidLength = 0;
 
 		if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100)) {
+			consecutiveNoTagPolls = 0;
 			Serial.println("[NFC] Tag detected!");
 
 			String uidStr = "";
 			for (uint8_t i = 0; i < uidLength; i++) {
 				uidStr += String(uid[i], HEX);
+			}
+
+			if (uidStr == presentedUid) {
+				vTaskDelay(pdMS_TO_TICKS(100));
+				continue;
+			}
+			presentedUid = uidStr;
+
+			if (hasBuildingBeenScanned(uidStr)) {
+				Serial.println("[NFC] Already scanned in this scenario, ignoring.");
+				vTaskDelay(pdMS_TO_TICKS(100));
+				continue;
 			}
 
 			uint8_t data[32] = {0};
@@ -254,9 +305,16 @@ void nfcTaskImpl(void *pvParameters) {
 				statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
 				tone(BUZZER_PIN, 100, 500);
 			}
+		} else {
+			if (consecutiveNoTagPolls < 2) {
+				++consecutiveNoTagPolls;
+			}
+			if (consecutiveNoTagPolls >= 2) {
+				presentedUid = "";
+			}
 		}
 
-		vTaskDelay(pdMS_TO_TICKS(150));
+		vTaskDelay(pdMS_TO_TICKS(presentedUid.length() > 0 ? 100 : 250));
 	}
 }
 
@@ -272,17 +330,31 @@ void setup() {
 	delay(1000);
 
 	Serial.println("\n\n[Main] Booting ESP32-S3...");
+	const esp_reset_reason_t resetReason = esp_reset_reason();
+	Serial.printf("[Main] Reset reason: %s (%d)\n", resetReasonName(resetReason), resetReason);
 
 	pinMode(BUZZER_PIN, OUTPUT);
 	digitalWrite(BUZZER_PIN, LOW);
+	pinMode(STATUS_LED_PIN, OUTPUT);
+	digitalWrite(STATUS_LED_PIN, LOW);
 
-	Wire.begin(SDA_PIN, SCL_PIN);
-	Wire.setClock(100000);
+	if (!Wire.setPins(SDA_PIN, SCL_PIN)) {
+		Serial.println("[NFC] Failed to configure I2C pins.");
+	}
 
 	pendingMutex = xSemaphoreCreateMutex();
 
 	nfc.begin();
-	uint32_t versiondata = nfc.getFirmwareVersion();
+	Wire.setClock(100000);
+	Wire.setTimeOut(50);
+	uint32_t versiondata = 0;
+	for (uint8_t attempt = 1; attempt <= 3 && !versiondata; ++attempt) {
+		versiondata = nfc.getFirmwareVersion();
+		if (!versiondata && attempt < 3) {
+			Serial.printf("[NFC] Firmware query failed (attempt %u/3); retrying.\n", attempt);
+			delay(200);
+		}
+	}
 	if (!versiondata) {
 		Serial.println("[NFC] PN532 board not found via I2C");
 		statusLedSetNfcAvailable(false);
@@ -290,16 +362,18 @@ void setup() {
 		statusLedSetNfcAvailable(true);
 		Serial.printf("[NFC] Found chip PN5%02X, Firmware ver. %d.%d\n",
 			(versiondata>>24) & 0xFF, (versiondata>>16) & 0xFF, (versiondata>>8) & 0xFF);
-		nfc.SAMConfig();
-		startNfcTask();
+		if (nfc.SAMConfig()) {
+			startNfcTask();
+		} else {
+			Serial.println("[NFC] Failed to configure PN532 SAM mode.");
+			statusLedSetNfcAvailable(false);
+		}
 	}
 
 	initSubstations();
 	networkSetup();
 	setupOta();
 	startNetworkTask();
-
-	statusLed = factory.createLed(STATUS_LED_PIN);
 
 	outChain = factory.createShiftRegisterChain(OUT_LATCH_PIN, OUT_DATA_PIN, SHARED_CLOCK_PIN);
 	inChain = factory.createInputShiftRegisterChain(IN_LOAD_PIN, IN_DATA_PIN, SHARED_CLOCK_PIN, INPUT_REGISTER_COUNT);
@@ -349,10 +423,7 @@ void setup() {
 	gasDisplay = disp3.left();
 	windPvDisplay = disp3.right();
 
-	displayTimer = timerBegin(0, 80, true);
-	timerAttachInterrupt(displayTimer, &onDisplayTimer, false);
-	timerAlarmWrite(displayTimer, 1000, true);
-	timerAlarmEnable(displayTimer);
+	startPeripheralRefreshTask();
 }
 
 void loop() {
@@ -419,6 +490,6 @@ void loop() {
 	if (now - lastLedToggleMs >= 500) {
 		lastLedToggleMs = now;
 		ledState = !ledState;
-		if (statusLed) statusLed->setState(ledState);
+		digitalWrite(STATUS_LED_PIN, ledState ? HIGH : LOW);
 	}
 }
