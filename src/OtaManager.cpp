@@ -68,11 +68,20 @@ void handleLog() {
     String body;
     uint32_t nextCursor = since;
     bool dropped = false;
-    DebugLog.readSince(since, body, nextCursor, dropped);
+    const bool hasData = DebugLog.readSince(since, body, nextCursor, dropped);
+    const uint32_t chunkStart =
+        nextCursor - static_cast<uint32_t>(body.length());
 
     otaServer.sendHeader("Cache-Control", "no-store");
     otaServer.sendHeader("X-Log-Cursor", String(nextCursor));
+    otaServer.sendHeader("X-Log-Start", String(chunkStart));
     otaServer.sendHeader("X-Log-Dropped", dropped ? "1" : "0");
+    otaServer.sendHeader("X-Log-Empty", hasData ? "0" : "1");
+
+    // WebServer::send() logs a warning for a zero-length body. Because core
+    // logs are mirrored into this same buffer, an empty polling response used
+    // to create a self-sustaining warning loop. Send an ignored placeholder.
+    if (!hasData) body = " ";
     otaServer.send(200, "text/plain; charset=utf-8", body);
 }
 
