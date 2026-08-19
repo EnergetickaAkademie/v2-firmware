@@ -1,5 +1,6 @@
 #include "GameState.h"
 #include "DebugLog.h"
+#include <Preferences.h>
 
 #define Serial DebugLog
 
@@ -28,6 +29,48 @@ SemaphoreHandle_t pendingMutex = nullptr;
 
 namespace {
 bool buildingScanningActive = false;
+bool buildingResetPending = false;
+bool buildingResetAcknowledged = false;
+uint32_t buildingResetReadyAtMs = 0;
+
+constexpr const char* BOARD_STATE_NAMESPACE = "board_state";
+constexpr const char* RESET_PENDING_KEY = "reset_pending";
+
+void persistResetPending(bool pending) {
+	Preferences preferences;
+	if (!preferences.begin(BOARD_STATE_NAMESPACE, false)) {
+		Serial.println("[NFC] Failed to open persistent reset state.");
+		return;
+	}
+	preferences.putBool(RESET_PENDING_KEY, pending);
+	preferences.end();
+}
+}
+
+void initPersistentGameState() {
+	Preferences preferences;
+	if (!preferences.begin(BOARD_STATE_NAMESPACE, true)) {
+		Serial.println("[NFC] Failed to read persistent reset state.");
+		return;
+	}
+	const bool pending = preferences.getBool(RESET_PENDING_KEY, false);
+	preferences.end();
+
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return;
+	}
+	buildingResetPending = pending;
+	if (pending) {
+		memset(authoritativeBuildingCounts, 0, sizeof(authoritativeBuildingCounts));
+		scannedBuildings.clear();
+		pendingBuildings.clear();
+	}
+	xSemaphoreGive(pendingMutex);
+
+	if (pending) {
+		Serial.println("[NFC] Restored pending building reset; server update will retry after reconnect.");
+	}
 }
 
 BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type) {
@@ -40,7 +83,10 @@ BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type) {
 	}
 
 	BuildingScanQueueResult result = BuildingScanQueueResult::Queued;
-	if (!buildingScanningActive) {
+	if (buildingResetPending ||
+		static_cast<int32_t>(millis() - buildingResetReadyAtMs) < 0) {
+		result = BuildingScanQueueResult::ResetPending;
+	} else if (!buildingScanningActive) {
 		result = BuildingScanQueueResult::Inactive;
 	} else {
 		for (const auto& building : scannedBuildings) {
@@ -97,4 +143,58 @@ void setBuildingScanScenarioState(bool active, bool resetCache) {
 	if (clearedState) {
 		Serial.println("[NFC] Cleared local scan state at scenario boundary.");
 	}
+}
+
+void requestBuildingReset() {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return;
+	}
+
+	buildingResetPending = true;
+	buildingResetAcknowledged = false;
+	buildingResetReadyAtMs = 0;
+	scannedBuildings.clear();
+	pendingBuildings.clear();
+	memset(authoritativeBuildingCounts, 0, sizeof(authoritativeBuildingCounts));
+	xSemaphoreGive(pendingMutex);
+
+	persistResetPending(true);
+	Serial.println("[NFC] Building reset accepted locally; waiting for server confirmation.");
+}
+
+bool isBuildingResetPending() {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return false;
+	}
+	const bool pending = buildingResetPending;
+	xSemaphoreGive(pendingMutex);
+	return pending;
+}
+
+void markBuildingResetCompleted() {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return;
+	}
+	buildingResetPending = false;
+	buildingResetAcknowledged = true;
+	// Give the next sync response time to deliver the authoritative zero
+	// counts before accepting new building scans.
+	buildingResetReadyAtMs = millis() + 1000;
+	xSemaphoreGive(pendingMutex);
+
+	persistResetPending(false);
+}
+
+bool consumeBuildingResetAcknowledged() {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return false;
+	}
+	const bool acknowledged = buildingResetAcknowledged;
+	buildingResetAcknowledged = false;
+	xSemaphoreGive(pendingMutex);
+	return acknowledged;
 }
