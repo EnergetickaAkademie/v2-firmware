@@ -13,7 +13,6 @@ HardwareSerial subSerial1(0);
 HardwareSerial subSerial2(2);
 HardwareSerial subSerial3(1);
 
-const uint8_t hwTypeMap[DEVICE_COUNT] = {4, 6, 2, 1, 3, 5};
 int32_t lastSentValues[DEVICE_COUNT] = {-1, -1, -1, -1, -1, -1};
 
 struct Substation {
@@ -21,9 +20,8 @@ struct Substation {
     String buffer;
     uint32_t lastAlive;
     bool online;
-    uint8_t counts[7];
-    bool needsUpdate[DEVICE_COUNT];
-    uint8_t pendingCommandIndex;
+    uint8_t counts[8];
+    bool needsBulkUpdate;
     uint32_t lastCommandSendMs;
     
     void init(HardwareSerial* p, int rx, int tx) {
@@ -33,9 +31,7 @@ struct Substation {
         online = false;
         lastAlive = 0;
         memset(counts, 0, sizeof(counts));
-        for(int i=0; i<DEVICE_COUNT; i++) needsUpdate[i] = true;
-
-        pendingCommandIndex = 0;
+        needsBulkUpdate = true;
         lastCommandSendMs = 0;
     }
 
@@ -45,7 +41,7 @@ struct Substation {
 };
 
 Substation subs[3];
-uint8_t totalCounts[7] = {0};
+uint8_t totalCounts[8] = {0};
 uint8_t onlineSubstationCount = 0;
 
 void initSubstations() {
@@ -59,12 +55,7 @@ void sendPendingSubstationCommands() {
         Substation& sub = subs[s];
         if (!sub.online) continue;
 
-        bool needsBulk = false;
-        for (int i = 0; i < DEVICE_COUNT; i++) {
-            if (sub.needsUpdate[i]) needsBulk = true;
-        }
-
-        if (needsBulk && (millis() - sub.lastCommandSendMs >= 150)) {
+        if (sub.needsBulkUpdate && (millis() - sub.lastCommandSendMs >= 150)) {
             // Map encoder percentages to powerplant types 1-8
             int pctMap[8] = {
                 (int)(encoderPercentages[5] * 100.0f), // Type 1 (Solar)
@@ -75,6 +66,17 @@ void sendPendingSubstationCommands() {
                 (int)(encoderPercentages[2] * 100.0f), // Type 6 (PumpStor)
                 (int)(encoderPercentages[0] * 100.0f), // Type 7 (Coal)
                 (int)(encoderPercentages[2] * 100.0f)  // Type 8 (Battery)
+            };
+
+            uint8_t actuatorPct[8] = {
+                0,                                             // Type 1 (Solar)
+                (uint8_t)constrain(pctMap[1], 0, 100),         // Type 2 (Wind)
+                (uint8_t)(encoderValuesMW[3] > 0 ? 100 : 0),   // Type 3 (Nuclear)
+                0,                                             // Type 4 (Gas)
+                (uint8_t)constrain(pctMap[4], 0, 100),         // Type 5 (Hydro)
+                0,                                             // Type 6 (PumpStor)
+                (uint8_t)(encoderValuesMW[0] > 0 ? 100 : 0),   // Type 7 (Coal)
+                0                                              // Type 8 (Battery)
             };
 
             String rgbCmd = "ALLRGB";
@@ -108,16 +110,14 @@ void sendPendingSubstationCommands() {
                 snprintf(buf, sizeof(buf), " %d %d %d", r, g, b);
                 rgbCmd += buf;
 
-                snprintf(buf, sizeof(buf), " %d", (pct > 0 ? 1 : 0));
+                snprintf(buf, sizeof(buf), " %u", static_cast<unsigned>(actuatorPct[i]));
                 motCmd += buf;
             }
 
             sub.send(rgbCmd.c_str());
             sub.send(motCmd.c_str());
 
-            for (int i = 0; i < DEVICE_COUNT; i++) {
-                sub.needsUpdate[i] = false;
-            }
+            sub.needsBulkUpdate = false;
             sub.lastCommandSendMs = millis();
         }
     }
@@ -132,32 +132,36 @@ void processSubstationLine(int subIndex, String line) {
     Substation& sub = subs[subIndex];
 
     if (line == "STATION_ON") {
+        const bool wasOnline = sub.online;
         sub.lastAlive = millis();
         sub.online = true;
-        
-        for (int i = 0; i < DEVICE_COUNT; i++) {
-            sub.needsUpdate[i] = true;
-        }
-        sub.pendingCommandIndex = 0;
+        if (!wasOnline) sub.needsBulkUpdate = true;
     }
     else if (line.startsWith("COUNTS ")) {
-        int counts[7];
-        if (sscanf(line.c_str(), "COUNTS %d %d %d %d %d %d %d",
-            &counts[0], &counts[1], &counts[2], &counts[3], &counts[4], &counts[5], &counts[6]) == 7) {
+        int counts[8];
+        char trailing;
+        const int parsed = sscanf(line.c_str(),
+            "COUNTS %d %d %d %d %d %d %d %d %c",
+            &counts[0], &counts[1], &counts[2], &counts[3],
+            &counts[4], &counts[5], &counts[6], &counts[7], &trailing);
+
+        bool valid = parsed == 8;
+        for (int i = 0; valid && i < 8; i++) {
+            valid = counts[i] >= 0 && counts[i] <= 255;
+        }
+
+        if (valid) {
+            const bool wasOnline = sub.online;
+            bool countsChanged = false;
             sub.lastAlive = millis();
             sub.online = true;
-            for (int type = 1; type <= 7; type++) {
-                int count = counts[type - 1];
-                if (count > sub.counts[type - 1]) {
-                    for (int i = 0; i < DEVICE_COUNT; i++) {
-                        if (hwTypeMap[i] == type) {
-                            sub.needsUpdate[i] = true;
-                            break;
-                        }
-                    }
+            for (int i = 0; i < 8; i++) {
+                if (sub.counts[i] != counts[i]) {
+                    countsChanged = true;
+                    sub.counts[i] = counts[i];
                 }
-                sub.counts[type - 1] = count;
             }
+            if (!wasOnline || countsChanged) sub.needsBulkUpdate = true;
         }
     }
 }
@@ -191,8 +195,7 @@ void queueSubstationUpdates() {
         if (val != lastSentValues[i]) {
             lastSentValues[i] = val;
             for(int s = 0; s < 3; s++) {
-                subs[s].needsUpdate[i] = true;
-                subs[s].pendingCommandIndex = 0;
+                subs[s].needsBulkUpdate = true;
             }
         }
     }
@@ -209,7 +212,7 @@ void updateTotalCounts() {
         }
         if (subs[s].online) {
             onlineSubstations++;
-            for (int i = 0; i < 7; i++) {
+            for (int i = 0; i < 8; i++) {
                 totalCounts[i] += subs[s].counts[i];
             }
         }
@@ -225,16 +228,11 @@ void updateTotalCounts() {
     onlineSubstationCount = onlineSubstations;
     statusLedSetSubstationCount(onlineSubstationCount);
 
-    for (int i = 1; i <= 7; i++) {
+    for (int i = 1; i <= 8; i++) {
         if (connectedCount[i] != totalCounts[i - 1]) {
             countsChanged = true;
             connectedCount[i] = totalCounts[i - 1];
         }
-    }
-
-    if (connectedCount[8] != connectedCount[6]) {
-        connectedCount[8] = connectedCount[6];
-        countsChanged = true;
     }
 
     static uint32_t lastPrintMs = 0;
@@ -254,12 +252,13 @@ void updateTotalCounts() {
             "  Nuclear  (3): %d\n"
             "  Gas      (4): %d\n"
             "  Hydro    (5): %d\n"
-            "  Pump/Bat (6 & 8): %d\n"
+            "  Pumped   (6): %d\n"
             "  Coal     (7): %d\n"
+            "  Battery  (8): %d\n"
             "========================================\n",
             onlineSubstations, connectedCount[1], connectedCount[2], 
             connectedCount[3], connectedCount[4], connectedCount[5], 
-            connectedCount[6], connectedCount[7]
+            connectedCount[6], connectedCount[7], connectedCount[8]
         );
 
         //Serial.print(outBuffer);

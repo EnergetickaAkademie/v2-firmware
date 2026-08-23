@@ -37,8 +37,13 @@ class PioUploadThread(QThread):
 
 	def run(self):
 		env = os.environ.copy()
-		
-		env["PLATFORMIO_BUILD_FLAGS"] = self.build_flags
+		# An empty override would hide the environment's normal build flags.
+		# Substations do not need per-device defines, so leave the PlatformIO
+		# environment unchanged for that target.
+		if self.build_flags:
+			env["PLATFORMIO_BUILD_FLAGS"] = self.build_flags
+		else:
+			env.pop("PLATFORMIO_BUILD_FLAGS", None)
 
 		self.log_signal.emit(f"--- Building and uploading {self.env_name} over serial ---")
 
@@ -277,7 +282,7 @@ class PowerplantManager(QWidget):
 	def __init__(self):
 		super().__init__()
 		
-		self.board_types = ["Powerplant", "Mainboard"]
+		self.board_types = ["Powerplant", "Substation", "Mainboard"]
 		self.device_types = [
 			"TYPE_UNKNOWN", "TYPE_NPP", "TYPE_GAS", "TYPE_BATTERY", 
 			"TYPE_COAL", "TYPE_WIND", "TYPE_HYDRO", "TYPE_HYDRO_PUMPED", "TYPE_SOLAR"
@@ -384,12 +389,18 @@ class PowerplantManager(QWidget):
 		self.update_upload_method_ui()
 
 	def update_board_ui(self):
-		is_powerplant = self.board_combo.currentText() == "Powerplant"
+		board_kind = self.board_combo.currentText()
+		is_powerplant = board_kind == "Powerplant"
+		is_mainboard = board_kind == "Mainboard"
 		self.type_combo.setEnabled(is_powerplant)
 		self.type_combo.setVisible(is_powerplant)
-		self.mainboard_form_widget.setVisible(not is_powerplant)
-		self.upload_btn.setText("Generate UID and Upload" if is_powerplant else "Upload Mainboard")
-		if not is_powerplant:
+		self.mainboard_form_widget.setVisible(is_mainboard)
+		self.upload_btn.setText({
+			"Powerplant": "Generate UID and Upload",
+			"Substation": "Upload Substation",
+			"Mainboard": "Upload Mainboard",
+		}.get(board_kind, "Upload"))
+		if is_mainboard:
 			self.prefill_mainboard_fields()
 		self.update_upload_method_ui()
 
@@ -400,12 +411,18 @@ class PowerplantManager(QWidget):
 		self.ota_password_input.setEchoMode(mode)
 
 	def update_upload_method_ui(self):
-		is_ota = self.upload_method_combo.currentText() == "Wi-Fi OTA"
+		is_mainboard = self.board_combo.currentText() == "Mainboard"
+		if not is_mainboard and self.upload_method_combo.currentText() != "USB / serial":
+			self.upload_method_combo.blockSignals(True)
+			self.upload_method_combo.setCurrentText("USB / serial")
+			self.upload_method_combo.blockSignals(False)
+		self.upload_method_combo.setEnabled(is_mainboard)
+		is_ota = is_mainboard and self.upload_method_combo.currentText() == "Wi-Fi OTA"
 
 		for widget in (self.ota_host_input, self.ota_port_input):
 			widget.setEnabled(is_ota)
 
-		self.ota_password_input.setEnabled(True)
+		self.ota_password_input.setEnabled(is_ota)
 
 		if hasattr(self, "port_combo"):
 			self.port_combo.setEnabled(not is_ota)
@@ -423,7 +440,8 @@ class PowerplantManager(QWidget):
 
 	def start_monitor(self, env_name=None):
 		self.stop_monitor()
-		is_mainboard = self.board_combo.currentText() == "Mainboard"
+		board_kind = self.board_combo.currentText()
+		is_mainboard = board_kind == "Mainboard"
 		is_ota = is_mainboard and self.upload_method_combo.currentText() == "Wi-Fi OTA"
 
 		if is_ota:
@@ -441,7 +459,14 @@ class PowerplantManager(QWidget):
 			self.monitor_thread = WifiLogThread(host, port, password)
 		else:
 			if env_name is None:
-				env_name = "mainboard" if is_mainboard else "powerplant"
+				env_name = {
+					"Powerplant": "powerplant",
+					"Substation": "substation",
+					"Mainboard": "mainboard",
+				}.get(board_kind)
+			if env_name is None:
+				self.log(f"ERROR: Unknown board type: {board_kind}")
+				return
 			self.monitor_thread = PioMonitorThread(env_name, self.get_selected_port())
 
 		self.monitor_thread.log_signal.connect(self.log)
@@ -649,6 +674,15 @@ class PowerplantManager(QWidget):
 			self.upload_thread.start()
 			return
 
+		if board_kind == "Substation":
+			self.upload_thread = PioUploadThread("substation", None, selected_port)
+			self.upload_thread.log_signal.connect(self.log)
+			self.upload_thread.finished_signal.connect(
+				lambda success: self.on_upload_finished(success, "substation", board_kind)
+			)
+			self.upload_thread.start()
+			return
+
 		try:
 			cfg = self.get_mainboard_form_values()
 			build_flags = self.build_mainboard_flags(cfg)
@@ -682,6 +716,8 @@ class PowerplantManager(QWidget):
 			if board_kind == "Powerplant" and hex_uid and selected_type:
 				self.save_uid(hex_uid, selected_type)
 				self.log(f"\nSUCCESS: Upload complete. {hex_uid} assigned to {selected_type} and saved.")
+			elif board_kind == "Substation":
+				self.log("\nSUCCESS: Substation upload complete.")
 			else:
 				self.log("\nSUCCESS: Mainboard upload complete.")
 
@@ -690,6 +726,8 @@ class PowerplantManager(QWidget):
 		else:
 			if board_kind == "Powerplant":
 				self.log("\nFAILED: Upload aborted. UID not saved.")
+			elif board_kind == "Substation":
+				self.log("\nFAILED: Substation upload aborted.")
 			else:
 				self.log("\nFAILED: Mainboard upload aborted.")
 

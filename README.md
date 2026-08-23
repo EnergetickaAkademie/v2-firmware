@@ -1,8 +1,18 @@
 # Firmware for ENAKv2 boards
 
-Notes: for testing, disconnect WCHLink, or the CH32V003 won't respond to UART commands.
+## Powerplant hardware and protocol
 
-`Serial.begin()` does not work, `if (USART1->STATR & USART_STATR_RXNE) { char incomingChar = USART1->DATAR & 0xFF; }` does. Huh...
+The current powerplant board uses PA2 for the communication LED, PC0 for the
+internal status RGB, PC4/PC3 for the L9110S inputs, PD0 for the optional solar
+RGB, and PA1 for the solar-panel ADC input. Connect a panel rated at no more
+than 1.5 V between PA1 and ground, preferably through a 4.7–10 kOhm series
+resistor.
+
+Wind and hydro use proportional PWM with a 15% start threshold, a 300 ms
+kick-start, and a 10% stop threshold. Coal and nuclear use binary nebulizer
+control with a five-second restart lockout after shutdown. Active actuators
+stop if commands are absent for 2.5 seconds.
+
 
 ## ESP32-S3 mainboard OTA
 
@@ -12,6 +22,10 @@ Notes: for testing, disconnect WCHLink, or the CH32V003 won't respond to UART co
 4. The uploader builds `.pio/build/mainboard/firmware.bin` and sends it to the authenticated endpoint on port 8080.
 
 The OTA password must contain at least eight characters. OTA updates apply only to the ESP32-S3 mainboard; CH32V003 powerplant and substation boards still require their wired programmer.
+
+For wired CH32V003 flashing, select **Powerplant** or **Substation** in
+`uploader.py`. Powerplants additionally require a device type and receive a
+generated UID; substations use the fixed `substation` PlatformIO environment.
 
 The uploader can also inspect logs without flashing. Select **USB / serial** and
 click **Show serial**, or select **Wi-Fi OTA** and click **Show Wi-Fi log**. The

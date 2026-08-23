@@ -30,6 +30,38 @@ volatile char rx_buffer[RX_BUF_SIZE];
 volatile uint16_t rx_head = 0;
 volatile uint16_t rx_tail = 0;
 
+bool parseUint8List(char* input, uint8_t* output, uint8_t count, uint8_t max_value) {
+	char* p = input;
+	for (uint8_t i = 0; i < count; i++) {
+		while (*p == ' ') p++;
+		if (*p < '0' || *p > '9') return false;
+
+		uint16_t value = 0;
+		while (*p >= '0' && *p <= '9') {
+			const uint8_t digit = static_cast<uint8_t>(*p - '0');
+			if (value > (max_value - digit) / 10) return false;
+			value = value * 10 + digit;
+			p++;
+		}
+		if (*p != '\0' && *p != ' ') return false;
+		output[i] = value;
+	}
+
+	while (*p == ' ') p++;
+	return *p == '\0';
+}
+
+void printCounts() {
+	uint8_t counts[8];
+	bus.getActiveCountsByType(counts, 8);
+	Serial.print("COUNTS");
+	for (uint8_t i = 0; i < 8; i++) {
+		Serial.print(" ");
+		Serial.print(counts[i]);
+	}
+	Serial.println();
+}
+
 extern "C" void USART1_IRQHandler(void) __attribute__((interrupt));
 extern "C" void USART1_IRQHandler(void) {
 	if (USART1->STATR & USART_STATR_RXNE) {
@@ -51,14 +83,7 @@ void processUartCommand(char* cmd) {
 		Serial.println("PONG");
 	}
 	else if (strcmp(cmd, "COUNTS?") == 0) {
-		uint8_t counts[7];
-		bus.getActiveCountsByType(counts, 7);
-		Serial.print("COUNTS");
-		for (int i = 0; i < 7; i++) {
-			Serial.print(" ");
-			Serial.print(counts[i]);
-		}
-		Serial.println();
+		printCounts();
 	}
 	else if (strncmp(cmd, "BLINK TYPE ", 11) == 0) {
 		int t = atoi(cmd + 11);
@@ -67,44 +92,25 @@ void processUartCommand(char* cmd) {
 		}
 	}
 	else if (strncmp(cmd, "ALLRGB ", 7) == 0) {
-		char* p = cmd + 7;
-		uint8_t temp_rgb[9][3];
-		int token_count = 0;
-
-		for (int t = 1; t <= 8; t++) {
-			for (int i = 0; i < 3; i++) {
-				while (*p == ' ') p++;
-				if (!*p) break;
-				temp_rgb[t][i] = (uint8_t)atoi(p);
-				token_count++;
-				while (*p && *p != ' ') p++;
+		uint8_t values[24];
+		if (parseUint8List(cmd + 7, values, 24, 255)) {
+			for (uint8_t type = 1; type <= 8; type++) {
+				memcpy(rgb_payloads[type], &values[(type - 1) * 3], 3);
 			}
-		}
-
-		//checksum: apply if no nums dropped
-		if (token_count == 24) {
-			memcpy(rgb_payloads, temp_rgb, sizeof(rgb_payloads));
 			Serial.println("ACK_RGB");
 		} else {
-			Serial.println("ERR_RGB_DROP");
+			Serial.println("ERR_RGB");
 		}
 	}
 	else if (strncmp(cmd, "ALLMOT ", 7) == 0) {
-		char* p = cmd + 7;
-		uint8_t temp_mot[9];
-		int token_count = 0;
-
-		for (int t = 1; t <= 8; t++) {
-			while (*p == ' ') p++;
-			if (!*p) break;
-			temp_mot[t] = (uint8_t)atoi(p);
-			token_count++;
-			while (*p && *p != ' ') p++;
-		}
-
-		if (token_count == 8) {
-			memcpy(motor_payloads, temp_mot, sizeof(motor_payloads));
+		uint8_t values[8];
+		if (parseUint8List(cmd + 7, values, 8, 100)) {
+			for (uint8_t type = 1; type <= 8; type++) {
+				motor_payloads[type] = values[type - 1];
+			}
 			Serial.println("ACK_MOT");
+		} else {
+			Serial.println("ERR_MOT");
 		}
 	}
 }
@@ -154,7 +160,8 @@ void loop() {
 				bitbus_scan_cmd = 1;
 			} else {
 				if (motor_payloads[bitbus_scan_type] > 0) {
-					bus.sendCommandToType(bitbus_scan_type, CMD_MOTOR_ON, nullptr, 0);
+					bus.sendCommandToType(bitbus_scan_type, CMD_MOTOR_ON,
+						&motor_payloads[bitbus_scan_type], 1);
 				} else {
 					bus.sendCommandToType(bitbus_scan_type, CMD_MOTOR_OFF, nullptr, 0);
 				}
@@ -183,15 +190,7 @@ void loop() {
 		}
 
 		if (!uart_sent_this_cycle) {
-			uint8_t counts[7];
-			bus.getActiveCountsByType(counts, 7);
-
-			Serial.print("COUNTS");
-			for (int i = 0; i < 7; i++) {
-				Serial.print(" ");
-				Serial.print(counts[i]);
-			}
-			Serial.println();
+			printCounts();
 			Serial.println("STATION_ON");
 
 			uart_sent_this_cycle = true;

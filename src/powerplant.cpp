@@ -2,11 +2,28 @@
 #include "slave.h"
 #include "PeripheralFactory.h"
 
-// Hardware Pin Definitions
-#define LED_PIN PA2          // Status LED
-#define RGB_PIN PC0          // NeoPixel Data Pin
-#define MOTOR_PIN_A PC4      // Motor Driver Input 1
-#define MOTOR_PIN_B PC3      // Motor Driver Input 2
+// Hardware pin mapping from v2_powerplant_2026-08-21.net.
+constexpr uint32_t POWERPLANT_STATUS_LED_PIN = PA2;
+constexpr uint32_t STATUS_RGB_PIN = PC0;
+constexpr uint32_t MOTOR_PIN_A = PC4;
+constexpr uint32_t MOTOR_PIN_B = PC3;
+constexpr uint32_t SOLAR_RGB_PIN = PD0;
+constexpr uint32_t SOLAR_ADC_PIN = PA1;
+
+constexpr uint8_t MOTOR_START_PERCENT = 15;
+constexpr uint8_t MOTOR_STOP_PERCENT = 10;
+constexpr uint8_t MOTOR_MIN_DUTY = 100;
+constexpr uint8_t MOTOR_MAX_DUTY = 255;
+constexpr uint32_t MOTOR_KICK_MS = 300;
+constexpr uint32_t NEBULIZER_COOLDOWN_MS = 5000;
+constexpr uint32_t ACTUATOR_COMMAND_TIMEOUT_MS = 2500;
+
+constexpr uint32_t SOLAR_SAMPLE_INTERVAL_MS = 25;
+constexpr uint32_t SOLAR_LED_INTERVAL_MS = 100;
+constexpr uint16_t SOLAR_ADC_MAX = 1023;
+constexpr uint16_t SOLAR_DARK_ADC = (50UL * SOLAR_ADC_MAX) / 3300UL;
+constexpr uint16_t SOLAR_BRIGHT_ADC = (1200UL * SOLAR_ADC_MAX) / 3300UL;
+constexpr uint8_t SOLAR_LED_BRIGHTNESS = 64;
 
 #ifndef DEVICE_TYPE
 #define DEVICE_TYPE TYPE_UNKNOWN
@@ -16,142 +33,236 @@
 #define DEVICE_UID 0x00000000
 #endif
 
-Motor* motor = nullptr;
-
 BusSlave powerplant(DEVICE_TYPE, DEVICE_UID);
-
-uint32_t led_turn_off_ms = 0;
-bool led_active = false;
-
 PeripheralFactory factory;
-SimpleRGB* myRGB = nullptr;
+SimpleRGB* status_rgb = nullptr;
+SimpleRGB* solar_rgb = nullptr;
+
+uint32_t status_led_turn_off_ms = 0;
+bool status_led_active = false;
+
+uint8_t requested_actuator_percent = 0;
+uint8_t driver_duty = 0;
+bool actuator_command_received = false;
+uint32_t last_actuator_command_ms = 0;
+
+bool motor_running = false;
+bool motor_kicking = false;
+uint32_t motor_kick_started_ms = 0;
+
+bool nebulizer_running = false;
+bool nebulizer_cooling_down = false;
+uint32_t nebulizer_stopped_ms = 0;
+
+uint32_t last_solar_sample_ms = 0;
+uint32_t last_solar_led_ms = 0;
+int32_t filtered_solar_adc_x8 = 0;
+bool solar_filter_initialized = false;
+uint8_t last_solar_r = 0;
+uint8_t last_solar_g = 0;
+bool solar_color_initialized = false;
+
+bool isVariableMotorType() {
+	return DEVICE_TYPE == TYPE_WIND || DEVICE_TYPE == TYPE_HYDRO;
+}
+
+bool isNebulizerType() {
+	return DEVICE_TYPE == TYPE_COAL || DEVICE_TYPE == TYPE_NPP;
+}
+
+bool hasActuator() {
+	return isVariableMotorType() || isNebulizerType();
+}
+
+void setDriverDuty(uint8_t duty) {
+	if (driver_duty == duty) return;
+	driver_duty = duty;
+	analogWrite(MOTOR_PIN_A, duty);
+	analogWrite(MOTOR_PIN_B, 0);
+}
+
+uint8_t motorDutyForPercent(uint8_t percent) {
+	if (percent <= MOTOR_START_PERCENT) return MOTOR_MIN_DUTY;
+	const uint16_t scaled = static_cast<uint16_t>(percent - MOTOR_START_PERCENT) *
+		(MOTOR_MAX_DUTY - MOTOR_MIN_DUTY);
+	return MOTOR_MIN_DUTY + scaled / (100 - MOTOR_START_PERCENT);
+}
+
+void updateVariableMotor(uint32_t now) {
+	if (motor_running && requested_actuator_percent < MOTOR_STOP_PERCENT) {
+		motor_running = false;
+		motor_kicking = false;
+		setDriverDuty(0);
+		return;
+	}
+
+	if (!motor_running) {
+		if (requested_actuator_percent < MOTOR_START_PERCENT) return;
+		motor_running = true;
+		motor_kicking = true;
+		motor_kick_started_ms = now;
+		setDriverDuty(MOTOR_MAX_DUTY);
+		return;
+	}
+
+	if (motor_kicking) {
+		if (now - motor_kick_started_ms < MOTOR_KICK_MS) return;
+		motor_kicking = false;
+	}
+
+	const uint8_t running_percent = max(requested_actuator_percent, MOTOR_START_PERCENT);
+	setDriverDuty(motorDutyForPercent(running_percent));
+}
+
+void updateNebulizer(uint32_t now) {
+	if (requested_actuator_percent == 0) {
+		if (nebulizer_running) {
+			nebulizer_running = false;
+			nebulizer_cooling_down = true;
+			nebulizer_stopped_ms = now;
+			setDriverDuty(0);
+		}
+		return;
+	}
+
+	if (nebulizer_running) return;
+
+	if (nebulizer_cooling_down) {
+		if (now - nebulizer_stopped_ms < NEBULIZER_COOLDOWN_MS) return;
+		nebulizer_cooling_down = false;
+	}
+
+	nebulizer_running = true;
+	setDriverDuty(MOTOR_MAX_DUTY);
+}
+
+void updateActuator(uint32_t now) {
+	if (!hasActuator()) {
+		setDriverDuty(0);
+		return;
+	}
+
+	if (actuator_command_received &&
+		now - last_actuator_command_ms >= ACTUATOR_COMMAND_TIMEOUT_MS) {
+		actuator_command_received = false;
+		requested_actuator_percent = 0;
+	}
+
+	if (isVariableMotorType()) updateVariableMotor(now);
+	else updateNebulizer(now);
+}
+
+void updateSolarIndicator(uint32_t now) {
+	if (solar_rgb == nullptr) return;
+
+	if (now - last_solar_sample_ms >= SOLAR_SAMPLE_INTERVAL_MS) {
+		last_solar_sample_ms = now;
+		const int32_t sample_x8 = static_cast<int32_t>(analogRead(SOLAR_ADC_PIN)) * 8;
+		if (!solar_filter_initialized) {
+			filtered_solar_adc_x8 = sample_x8;
+			solar_filter_initialized = true;
+		} else {
+			filtered_solar_adc_x8 += (sample_x8 - filtered_solar_adc_x8) / 8;
+		}
+	}
+
+	if (!solar_filter_initialized || now - last_solar_led_ms < SOLAR_LED_INTERVAL_MS) return;
+	last_solar_led_ms = now;
+
+	const uint16_t filtered_adc = filtered_solar_adc_x8 / 8;
+	uint8_t level = 0;
+	if (filtered_adc >= SOLAR_BRIGHT_ADC) {
+		level = 255;
+	} else if (filtered_adc > SOLAR_DARK_ADC) {
+		level = static_cast<uint32_t>(filtered_adc - SOLAR_DARK_ADC) * 255 /
+			(SOLAR_BRIGHT_ADC - SOLAR_DARK_ADC);
+	}
+
+	uint8_t r;
+	uint8_t g;
+	if (level <= 127) {
+		r = SOLAR_LED_BRIGHTNESS;
+		g = static_cast<uint16_t>(level) * SOLAR_LED_BRIGHTNESS / 127;
+	} else {
+		r = static_cast<uint16_t>(255 - level) * SOLAR_LED_BRIGHTNESS / 128;
+		g = SOLAR_LED_BRIGHTNESS;
+	}
+
+	if (!solar_color_initialized || r != last_solar_r || g != last_solar_g) {
+		solar_rgb->setColor(r, g, 0);
+		last_solar_r = r;
+		last_solar_g = g;
+		solar_color_initialized = true;
+	}
+}
 
 void handleCommand(uint8_t cmd, const uint8_t* payload, uint8_t len) {
 	switch (cmd) {
 		case CMD_LED_BLINK:
-			digitalWrite(LED_PIN, HIGH);
-			led_turn_off_ms = millis() + 100;
-			led_active = true;
+			digitalWrite(POWERPLANT_STATUS_LED_PIN, HIGH);
+			status_led_turn_off_ms = millis() + 100;
+			status_led_active = true;
 			break;
 
 		case CMD_RGB:
-			if (len >= 3 && myRGB != nullptr) {
-				myRGB->setColor(payload[0], payload[1], payload[2]);
+			if (len == 3 && payload != nullptr && status_rgb != nullptr) {
+				status_rgb->setColor(payload[0], payload[1], payload[2]);
 			}
 			break;
 
 		case CMD_MOTOR_ON:
-			if(DEVICE_TYPE == TYPE_WIND or DEVICE_TYPE == TYPE_HYDRO){
-				//myRGB->setColor(100, 100, 100);
-				//motor->forward(700);
-				// For MOTOR_PIN_A (PC4 / TIM1_CH1)
-				TIM_SetCompare1(TIM1, 100); 
-
-				// For MOTOR_PIN_B (PC5 / TIM1_CH3)
-				TIM_SetCompare3(TIM1, 0);
+			if (!hasActuator() || len != 1 || payload == nullptr ||
+				payload[0] == 0 || payload[0] > 100) {
+				break;
 			}
-			
-			else{
-				digitalWrite(MOTOR_PIN_A, HIGH);
-				digitalWrite(MOTOR_PIN_B, LOW);
-			}
-
+			requested_actuator_percent = payload[0];
+			last_actuator_command_ms = millis();
+			actuator_command_received = true;
 			break;
 
 		case CMD_MOTOR_OFF:
-			if(DEVICE_TYPE == TYPE_WIND or DEVICE_TYPE == TYPE_HYDRO){
-				//motor->stop();
-				// For MOTOR_PIN_A (PC4 / TIM1_CH1)
-				TIM_SetCompare1(TIM1, 0); 
-
-				// For MOTOR_PIN_B (PC5 / TIM1_CH3)
-				TIM_SetCompare3(TIM1, 0);
-			}
-		
-			else{
-				digitalWrite(MOTOR_PIN_A, LOW);
-				digitalWrite(MOTOR_PIN_B, LOW);
-			}
-			
+			if (!hasActuator() || len != 0) break;
+			requested_actuator_percent = 0;
+			last_actuator_command_ms = millis();
+			actuator_command_received = true;
 			break;
 	}
 }
 
-void setupMotorPWM() {
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM1 | RCC_APB2Periph_GPIOC | RCC_APB2Periph_AFIO, ENABLE);
-
-	GPIO_PinRemapConfig(GPIO_FullRemap_TIM1, ENABLE);
-
-	GPIO_InitTypeDef GPIO_InitStructure = {0};
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4 | GPIO_Pin_5;
-	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
-	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_Init(GPIOC, &GPIO_InitStructure);
-
-	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure = {0};
-	TIM_TimeBaseStructure.TIM_Period = 255;
-	TIM_TimeBaseStructure.TIM_Prescaler = (48000000 / 1000 / 256) - 1; 
-	TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
-	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
-	TIM_TimeBaseInit(TIM1, &TIM_TimeBaseStructure);
-
-	TIM_OCInitTypeDef TIM_OCInitStructure = {0};
-	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
-	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
-	TIM_OCInitStructure.TIM_Pulse = 0;
-	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
-
-	TIM_OC1Init(TIM1, &TIM_OCInitStructure);
-	TIM_OC1PreloadConfig(TIM1, TIM_OCPreload_Enable);
-
-	TIM_OC3Init(TIM1, &TIM_OCInitStructure);
-	TIM_OC3PreloadConfig(TIM1, TIM_OCPreload_Enable);
-
-	TIM_CtrlPWMOutputs(TIM1, ENABLE);
-	TIM_Cmd(TIM1, ENABLE);
-}
-
 void setup() {
-	// Status LED
-	pinMode(LED_PIN, OUTPUT);
-	digitalWrite(LED_PIN, LOW);
-	
-	if(DEVICE_TYPE == TYPE_WIND or DEVICE_TYPE == TYPE_HYDRO){
-		//motor = factory.createMotor(MOTOR_PIN_B, MOTOR_PIN_A, 50);
-		//pinMode(MOTOR_PIN_A, OUTPUT);
-		//pinMode(MOTOR_PIN_B, OUTPUT);
-		//analogWrite(MOTOR_PIN_A, 0);
-		//analogWrite(MOTOR_PIN_B, 0);
-		setupMotorPWM();
+	pinMode(POWERPLANT_STATUS_LED_PIN, OUTPUT);
+	digitalWrite(POWERPLANT_STATUS_LED_PIN, LOW);
+
+	analogWriteResolution(8);
+	analogWriteFrequency(1000);
+	pinMode(MOTOR_PIN_A, OUTPUT);
+	pinMode(MOTOR_PIN_B, OUTPUT);
+	analogWrite(MOTOR_PIN_A, 0);
+	analogWrite(MOTOR_PIN_B, 0);
+
+	status_rgb = factory.createSimpleRGB(STATUS_RGB_PIN);
+	if (status_rgb != nullptr) status_rgb->setColor(5, 0, 5);
+
+	if (DEVICE_TYPE == TYPE_SOLAR) {
+		pinMode(SOLAR_ADC_PIN, INPUT_ANALOG);
+		solar_rgb = factory.createSimpleRGB(SOLAR_RGB_PIN);
+		if (solar_rgb != nullptr) solar_rgb->setColor(SOLAR_LED_BRIGHTNESS, 0, 0);
 	}
 
-
-	else{
-		pinMode(MOTOR_PIN_A, OUTPUT);
-		pinMode(MOTOR_PIN_B, OUTPUT);
-		digitalWrite(MOTOR_PIN_A, LOW);
-		digitalWrite(MOTOR_PIN_B, LOW);
-	}
-
-
-	myRGB = factory.createSimpleRGB(RGB_PIN);
-	if (myRGB != nullptr) {
-		myRGB->setColor(5, 0, 5);
-	}
-	
 	powerplant.begin();
 	powerplant.setCommandCallback(handleCommand);
 }
 
 void loop() {
 	powerplant.listen();
-	
-	// Flushes hardware peripheral updates (like WS2812 color changes)
-	factory.update(); 
 
-	// Handle non-blocking LED blink duration
-	if (led_active && millis() >= led_turn_off_ms) {
-		digitalWrite(LED_PIN, LOW);
-		led_active = false;
+	const uint32_t now = millis();
+	updateActuator(now);
+	updateSolarIndicator(now);
+	factory.update();
+
+	if (status_led_active && static_cast<int32_t>(now - status_led_turn_off_ms) >= 0) {
+		digitalWrite(POWERPLANT_STATUS_LED_PIN, LOW);
+		status_led_active = false;
 	}
 }
