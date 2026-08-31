@@ -1,0 +1,36 @@
+name: Release mainboard firmware
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build universal mainboard image
+        env:
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          export PLATFORMIO_BUILD_FLAGS="-DFIRMWARE_VERSION=\"${TAG_VERSION#v}\" -DWIFI_SSID=\"__UNPROVISIONED__\" -DWIFI_PASS=\"__UNPROVISIONED__\" -DAPI_BASE_URL=\"__UNPROVISIONED__\" -DBOARD_USERNAME=\"__UNPROVISIONED__\" -DBOARD_PASSWORD=\"__UNPROVISIONED__\" -DOTA_PASSWORD=\"CHANGE_ME\""
+          pio run -e mainboard
+          cp .pio/build/mainboard/firmware.bin mb_firmware.bin
+          sha256sum mb_firmware.bin | awk '{print $1}' > mb_firmware.bin.sha256
+          python -c 'import hashlib,json,os; p="mb_firmware.bin"; print(json.dumps({"version":os.environ["TAG_VERSION"][1:],"channel":"prerelease" if "-" in os.environ["TAG_VERSION"] else "stable","board":"mainboard","size":os.path.getsize(p),"sha256":hashlib.sha256(open(p,"rb").read()).hexdigest(),"config_schema":1}, indent=2))' > mb_firmware.json
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          args=(mb_firmware.bin mb_firmware.bin.sha256 mb_firmware.json)
+          if [[ "$TAG_VERSION" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$TAG_VERSION" "${args[@]}" --generate-notes --title "$TAG_VERSION"

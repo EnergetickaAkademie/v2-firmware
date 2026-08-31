@@ -8,6 +8,7 @@
 #include "DebugLog.h"
 #include "GameState.h"
 #include "OtaManager.h"
+#include "RuntimeConfig.h"
 #include "StatusLedManager.h"
 
 #define Serial DebugLog
@@ -65,6 +66,13 @@ enum class SyncV2Result {
     NotSupported,
     Failed,
 };
+
+void addBoardMetadata(HTTPClient& http) {
+    http.addHeader("X-ENAK-Firmware-Version", FIRMWARE_VERSION);
+    http.addHeader("X-ENAK-OTA-Port", String(runtimeOtaPort()));
+    http.addHeader("X-ENAK-OTA-Ready", runtimeConfigReady() ? "1" : "0");
+    http.addHeader("X-ENAK-Config-Schema", String(runtimeConfigSchema()));
+}
 
 void beginWifiConnection(const String& ssid, const String& password, uint8_t security) {
     if (security == 0) {
@@ -343,7 +351,7 @@ bool processPendingBuildingReset(uint32_t now) {
     lastAttemptMs = now;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/board/reset_buildings");
+    http.begin(runtimeApiBaseUrl() + "/board/reset_buildings");
     http.addHeader("Authorization", "Bearer " + jwtToken);
     int code = http.POST("");
     const bool success = code >= 200 && code < 300;
@@ -410,6 +418,13 @@ void initNetworkConfig() {
     activeWifiPassword = wifiPreferences.getString("password", WIFI_PASS);
     activeWifiSecurity = wifiPreferences.getUChar(
         "security", activeWifiPassword.length() == 0 ? 0 : 1);
+    // Preserve compile-time Wi-Fi settings across the first generic OTA
+    // upgrade. Never overwrite credentials provisioned through NFC.
+    if (!wifiPreferences.isKey("ssid") && activeWifiSsid.length() > 0) {
+        wifiPreferences.putString("ssid", activeWifiSsid);
+        wifiPreferences.putString("password", activeWifiPassword);
+        wifiPreferences.putUChar("security", activeWifiSecurity);
+    }
 
     candidateWifiPending = wifiPreferences.getBool("candidate", false);
     if (candidateWifiPending) {
@@ -470,12 +485,12 @@ bool authenticate() {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/login");
+    http.begin(runtimeApiBaseUrl() + "/login");
     http.addHeader("Content-Type", "application/json");
 
     JsonDocument doc;
-    doc["username"] = BOARD_USERNAME;
-    doc["password"] = BOARD_PASSWORD;
+    doc["username"] = runtimeBoardUsername();
+    doc["password"] = runtimeBoardPassword();
 
     String requestBody;
     serializeJson(doc, requestBody);
@@ -513,8 +528,9 @@ bool registerBoard() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return false;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/register");
+    http.begin(runtimeApiBaseUrl() + "/register");
     http.addHeader("Authorization", "Bearer " + jwtToken);
+    addBoardMetadata(http);
 
     int httpCode = http.POST("");
     bool success = false;
@@ -557,7 +573,7 @@ void pollGameState() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/poll_binary");
+    http.begin(runtimeApiBaseUrl() + "/poll_binary");
     http.addHeader("Authorization", "Bearer " + jwtToken);
 
     int httpCode = http.GET();
@@ -624,7 +640,7 @@ void pollProductionRanges() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/prod_vals");
+    http.begin(runtimeApiBaseUrl() + "/prod_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
 
     int httpCode = http.GET();
@@ -673,7 +689,7 @@ void pollConsumptionValues() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/cons_vals");
+    http.begin(runtimeApiBaseUrl() + "/cons_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
 
     int httpCode = http.GET();
@@ -734,8 +750,9 @@ SyncV2Result syncBoardV2() {
     }
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/board/sync/v2");
+    http.begin(runtimeApiBaseUrl() + "/board/sync/v2");
     http.addHeader("Authorization", "Bearer " + jwtToken);
+    addBoardMetadata(http);
     http.addHeader("Content-Type", "application/octet-stream");
 
     int httpCode = http.POST(requestBody, sizeof(requestBody));
@@ -854,7 +871,7 @@ void postTelemetry() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/post_vals");
+    http.begin(runtimeApiBaseUrl() + "/post_vals");
     http.addHeader("Authorization", "Bearer " + jwtToken);
     http.addHeader("Content-Type", "application/octet-stream");
 
@@ -985,7 +1002,7 @@ bool sendAddBuilding(uint8_t type, const String& uid) {
     }
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/board/add_building");
+    http.begin(runtimeApiBaseUrl() + "/board/add_building");
     http.addHeader("Authorization", "Bearer " + jwtToken);
     http.addHeader("Content-Type", "application/octet-stream");
 
@@ -1018,7 +1035,7 @@ void pollBuildingCounts() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
-    http.begin(String(API_BASE_URL) + "/board/get_counts");
+    http.begin(runtimeApiBaseUrl() + "/board/get_counts");
     http.addHeader("Authorization", "Bearer " + jwtToken);
 
     int code = http.GET();
