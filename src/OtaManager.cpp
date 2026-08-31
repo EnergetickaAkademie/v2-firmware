@@ -13,6 +13,7 @@
 #include "Config.h"
 #include "DebugLog.h"
 #include "StatusLedManager.h"
+#include "RuntimeConfig.h"
 
 #define Serial DebugLog
 
@@ -57,10 +58,10 @@ void setPullFailure(const String& message) {
 }
 
 bool isAuthorized() {
-    if (strlen(OTA_PASSWORD) < 8 || strcmp(OTA_PASSWORD, "CHANGE_ME") == 0) {
+    if (!runtimeConfigReady() || runtimeOtaPassword().length() < 8) {
         return false;
     }
-    return otaServer.header(AUTH_HEADER) == OTA_PASSWORD;
+    return otaServer.header(AUTH_HEADER) == runtimeOtaPassword();
 }
 
 void sendJson(int status, const String& body) {
@@ -76,18 +77,21 @@ void handleStatus() {
     String body = "{\"firmware_version\":\"";
     body += FIRMWARE_VERSION;
     body += "\",\"board_id\":\"";
-    body += BOARD_USERNAME;
+    body += runtimeBoardUsername();
     body += "\",\"hostname\":\"";
-    body += OTA_HOSTNAME;
+    body += runtimeOtaHostname();
     body += "\",\"ip\":\"";
     body += WiFi.localIP().toString();
     body += "\",\"update_in_progress\":";
     body += updateInProgress ? "true" : "false";
+    body += ",\"ota_port\":";
+    body += String(runtimeOtaPort());
+    body += ",\"config_schema\":";
+    body += String(runtimeConfigSchema());
+    body += ",\"ota_ready\":";
+    body += runtimeConfigReady() ? "true" : "false";
     body += ",\"log_cursor\":";
     body += String(DebugLog.cursor());
-    body += ",\"ota_port\":";
-    body += String(OTA_PORT);
-    body += ",\"config_schema\":1";
     body += "}";
     sendJson(200, body);
 }
@@ -149,6 +153,11 @@ void handleUploadChunk() {
     HTTPUpload& upload = otaServer.upload();
 
     if (upload.status == UPLOAD_FILE_START) {
+        if (updateInProgress) {
+            uploadAuthorized = false;
+            Serial.println("[OTA] Rejected concurrent firmware upload.");
+            return;
+        }
         uploadAuthorized = isAuthorized();
         uploadSucceeded = false;
 
@@ -219,16 +228,16 @@ void startServer() {
     });
     otaServer.begin();
 
-    if (!MDNS.begin(OTA_HOSTNAME)) {
+    if (!MDNS.begin(runtimeOtaHostname().c_str())) {
         Serial.println("[OTA] mDNS setup failed; use the board IP address.");
     } else {
-        MDNS.addService("http", "tcp", OTA_PORT);
+        MDNS.addService("http", "tcp", runtimeOtaPort());
     }
 
     serverStarted = true;
     Serial.printf("[OTA] Ready at http://%s:%u%s (IP %s).\n",
-                  OTA_HOSTNAME,
-                  OTA_PORT,
+                  runtimeOtaHostname().c_str(),
+                  runtimeOtaPort(),
                   OTA_PATH,
                   WiFi.localIP().toString().c_str());
 }
@@ -253,7 +262,7 @@ void setupOta() {
         otaPreferences.putString("state", pullState);
         otaPreferences.putString("error", pullError);
     }
-    if (strlen(OTA_PASSWORD) < 8 || strcmp(OTA_PASSWORD, "CHANGE_ME") == 0) {
+    if (!runtimeConfigReady()) {
         Serial.println("[OTA] Disabled: configure an OTA password with at least 8 characters.");
         return;
     }

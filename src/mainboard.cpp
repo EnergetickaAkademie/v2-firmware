@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <vector>
 #include "Config.h"
+#include "RuntimeConfig.h"
 #include "GameState.h"
 #include "NetworkManager.h"
 #include "OtaManager.h"
@@ -597,6 +598,7 @@ void setup() {
 
 	pendingMutex = xSemaphoreCreateMutex();
 	initPersistentGameState();
+	initRuntimeConfig();
 	initNetworkConfig();
 
 	nfc.begin();
