@@ -17,3 +17,11 @@ ota_port = 8080
 ota_password = replace-with-a-long-random-password
 ota_hostname = enak-mainboard-1
 firmware_version = 0.1.0
+firmware_channel = stable
+
+# Used by “Build Firmware + Manifest”. The URL must point to the hosted binary.
+firmware_download_url = https://downloads.example.com/enak/mb_firmware.bin
+firmware_artifact_dir = artifacts
+firmware_manifest_file = artifacts/firmware-manifest.json
+firmware_notes_url =
+firmware_config_schema = 1

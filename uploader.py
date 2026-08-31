@@ -2,6 +2,8 @@ import sys
 import os
 import random
 import json
+import hashlib
+import shutil
 import subprocess
 import configparser
 import re
@@ -24,6 +26,62 @@ from PyQt5.QtCore import QThread, pyqtSignal
 PROJECT_DIR = Path(__file__).resolve().parent
 UID_FILE = PROJECT_DIR / "used_uids.json"
 MAINBOARD_CONFIG_FILE = PROJECT_DIR / "uploader.conf"
+
+
+def resolve_project_path(value):
+	path = Path(value).expanduser()
+	return path if path.is_absolute() else PROJECT_DIR / path
+
+
+def update_firmware_manifest(manifest_path, version, channel, download_url, firmware_path, notes_url, config_schema):
+	if not download_url.startswith("https://"):
+		raise ValueError("Firmware download URL must use HTTPS")
+	if channel not in ("stable", "prerelease"):
+		raise ValueError("Firmware channel must be stable or prerelease")
+	if not firmware_path.is_file():
+		raise FileNotFoundError(f"Firmware image not found: {firmware_path}")
+
+	digest = hashlib.sha256()
+	with firmware_path.open("rb") as firmware:
+		first_byte = firmware.read(1)
+		for chunk in iter(lambda: firmware.read(1024 * 1024), b""):
+			digest.update(chunk)
+	sha256 = digest.hexdigest()
+	if first_byte != b"\xe9":
+		raise ValueError("Generated file is not an ESP32 firmware image")
+
+	manifest = {"releases": []}
+	if manifest_path.is_file():
+		with manifest_path.open("r", encoding="utf-8") as manifest_file:
+			manifest = json.load(manifest_file)
+		if not isinstance(manifest, dict) or not isinstance(manifest.get("releases"), list):
+			raise ValueError("Existing manifest must contain a releases array")
+
+	release = {
+		"version": version,
+		"channel": channel,
+		"config_schema": int(config_schema),
+		"asset": {
+			"url": download_url,
+			"sha256": sha256,
+			"size": firmware_path.stat().st_size,
+		},
+	}
+	if notes_url:
+		release["notes_url"] = notes_url
+
+	manifest["releases"] = [
+		item for item in manifest["releases"]
+		if not isinstance(item, dict) or item.get("version") != version
+	]
+	manifest["releases"].append(release)
+	manifest_path.parent.mkdir(parents=True, exist_ok=True)
+	temporary_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+	with temporary_path.open("w", encoding="utf-8") as manifest_file:
+		json.dump(manifest, manifest_file, indent=2)
+		manifest_file.write("\n")
+	temporary_path.replace(manifest_path)
+	return sha256, firmware_path.stat().st_size
 
 class PioUploadThread(QThread):
 	log_signal = pyqtSignal(str)
@@ -139,6 +197,73 @@ class PioOtaThread(QThread):
 			self.finished_signal.emit(False)
 		except requests.RequestException as exc:
 			self.log_signal.emit(f"ERROR: OTA connection failed: {exc}")
+			self.finished_signal.emit(False)
+		except Exception as exc:
+			self.log_signal.emit(f"ERROR: {exc}")
+			self.finished_signal.emit(False)
+
+
+class PioArtifactThread(QThread):
+	log_signal = pyqtSignal(str)
+	finished_signal = pyqtSignal(bool)
+
+	def __init__(self, build_flags, version, channel, download_url, artifact_dir, manifest_path, notes_url, config_schema):
+		super().__init__()
+		self.build_flags = build_flags
+		self.version = version
+		self.channel = channel
+		self.download_url = download_url
+		self.artifact_dir = artifact_dir
+		self.manifest_path = manifest_path
+		self.notes_url = notes_url
+		self.config_schema = config_schema
+
+	def run(self):
+		env = os.environ.copy()
+		env["PLATFORMIO_BUILD_FLAGS"] = self.build_flags
+		try:
+			self.log_signal.emit("--- Building mainboard firmware artifact ---")
+			try:
+				process = subprocess.Popen(
+					["pio", "run", "-e", "mainboard"],
+					cwd=PROJECT_DIR,
+					env=env,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.STDOUT,
+					text=True,
+				)
+			except FileNotFoundError:
+				self.log_signal.emit("ERROR: 'pio' command not found. Ensure PlatformIO is in your system PATH.")
+				self.finished_signal.emit(False)
+				return
+			for line in process.stdout:
+				self.log_signal.emit(line.rstrip())
+			process.wait()
+			if process.returncode != 0:
+				self.finished_signal.emit(False)
+				return
+
+			built_firmware = PROJECT_DIR / ".pio" / "build" / "mainboard" / "firmware.bin"
+			if not built_firmware.is_file():
+				raise FileNotFoundError(f"Firmware image not found: {built_firmware}")
+			self.artifact_dir.mkdir(parents=True, exist_ok=True)
+			artifact_path = self.artifact_dir / "mb_firmware.bin"
+			shutil.copy2(built_firmware, artifact_path)
+			sha256, size = update_firmware_manifest(
+				self.manifest_path,
+				self.version,
+				self.channel,
+				self.download_url,
+				artifact_path,
+				self.notes_url,
+				self.config_schema,
+			)
+			self.log_signal.emit(f"Artifact written: {artifact_path} ({size} bytes)")
+			self.log_signal.emit(f"Manifest written: {self.manifest_path}")
+			self.log_signal.emit(f"SHA-256: {sha256}")
+			self.finished_signal.emit(True)
+		except FileNotFoundError as exc:
+			self.log_signal.emit(f"ERROR: {exc}")
 			self.finished_signal.emit(False)
 		except Exception as exc:
 			self.log_signal.emit(f"ERROR: {exc}")
@@ -339,6 +464,12 @@ class PowerplantManager(QWidget):
 		self.ota_password_input.setEchoMode(QLineEdit.Password)
 		self.ota_hostname_input = QLineEdit("enak-mainboard")
 		self.firmware_version_input = QLineEdit("0.1.0")
+		self.firmware_channel_input = QLineEdit("stable")
+		self.firmware_download_url_input = QLineEdit()
+		self.firmware_artifact_dir_input = QLineEdit()
+		self.firmware_manifest_file_input = QLineEdit()
+		self.firmware_notes_url_input = QLineEdit()
+		self.firmware_config_schema_input = QLineEdit("1")
 
 		self.show_passwords_checkbox = QCheckBox("Show passwords")
 		self.show_passwords_checkbox.toggled.connect(self.on_show_passwords_toggled)
@@ -354,6 +485,12 @@ class PowerplantManager(QWidget):
 		self.mainboard_form_layout.addRow("OTA password", self.ota_password_input)
 		self.mainboard_form_layout.addRow("OTA hostname", self.ota_hostname_input)
 		self.mainboard_form_layout.addRow("Firmware version", self.firmware_version_input)
+		self.mainboard_form_layout.addRow("Firmware channel", self.firmware_channel_input)
+		self.mainboard_form_layout.addRow("Firmware download URL", self.firmware_download_url_input)
+		self.mainboard_form_layout.addRow("Artifact directory", self.firmware_artifact_dir_input)
+		self.mainboard_form_layout.addRow("Manifest file", self.firmware_manifest_file_input)
+		self.mainboard_form_layout.addRow("Release notes URL", self.firmware_notes_url_input)
+		self.mainboard_form_layout.addRow("Config schema", self.firmware_config_schema_input)
 		self.mainboard_form_layout.addRow("", self.show_passwords_checkbox)
 
 		layout.addWidget(self.mainboard_form_widget)
@@ -368,6 +505,10 @@ class PowerplantManager(QWidget):
 		self.upload_btn = QPushButton('Generate UID and Upload')
 		self.upload_btn.clicked.connect(self.start_upload)
 		layout.addWidget(self.upload_btn)
+
+		self.artifact_btn = QPushButton('Build Firmware + Manifest')
+		self.artifact_btn.clicked.connect(self.generate_artifacts)
+		layout.addWidget(self.artifact_btn)
 
 		self.monitor_checkbox = QCheckBox("Show serial output after upload")
 		layout.addWidget(self.monitor_checkbox)
@@ -400,6 +541,8 @@ class PowerplantManager(QWidget):
 			"Substation": "Upload Substation",
 			"Mainboard": "Upload Mainboard",
 		}.get(board_kind, "Upload"))
+		self.artifact_btn.setVisible(is_mainboard)
+		self.artifact_btn.setEnabled(is_mainboard and not (self.upload_thread and self.upload_thread.isRunning()))
 		if is_mainboard:
 			self.prefill_mainboard_fields()
 		self.update_upload_method_ui()
@@ -523,6 +666,12 @@ class PowerplantManager(QWidget):
 			"ota_password": section.get("ota_password", "").strip(),
 			"ota_hostname": section.get("ota_hostname", "enak-mainboard").strip(),
 			"firmware_version": section.get("firmware_version", "0.1.0").strip(),
+			"firmware_channel": section.get("firmware_channel", "").strip(),
+			"firmware_download_url": section.get("firmware_download_url", "").strip(),
+			"firmware_artifact_dir": section.get("firmware_artifact_dir", "").strip(),
+			"firmware_manifest_file": section.get("firmware_manifest_file", "").strip(),
+			"firmware_notes_url": section.get("firmware_notes_url", "").strip(),
+			"firmware_config_schema": section.get("firmware_config_schema", "").strip(),
 		}
 
 	def prefill_mainboard_fields(self):
@@ -541,6 +690,12 @@ class PowerplantManager(QWidget):
 		self.ota_password_input.setText(cfg["ota_password"])
 		self.ota_hostname_input.setText(cfg["ota_hostname"])
 		self.firmware_version_input.setText(cfg["firmware_version"])
+		self.firmware_channel_input.setText(cfg["firmware_channel"])
+		self.firmware_download_url_input.setText(cfg["firmware_download_url"])
+		self.firmware_artifact_dir_input.setText(cfg["firmware_artifact_dir"])
+		self.firmware_manifest_file_input.setText(cfg["firmware_manifest_file"])
+		self.firmware_notes_url_input.setText(cfg["firmware_notes_url"])
+		self.firmware_config_schema_input.setText(cfg["firmware_config_schema"])
 
 	def get_mainboard_form_values(self):
 		cfg = {
@@ -554,6 +709,12 @@ class PowerplantManager(QWidget):
 			"ota_password": self.ota_password_input.text().strip(),
 			"ota_hostname": self.ota_hostname_input.text().strip(),
 			"firmware_version": self.firmware_version_input.text().strip(),
+			"firmware_channel": self.firmware_channel_input.text().strip(),
+			"firmware_download_url": self.firmware_download_url_input.text().strip(),
+			"firmware_artifact_dir": self.firmware_artifact_dir_input.text().strip(),
+			"firmware_manifest_file": self.firmware_manifest_file_input.text().strip(),
+			"firmware_notes_url": self.firmware_notes_url_input.text().strip(),
+			"firmware_config_schema": self.firmware_config_schema_input.text().strip(),
 		}
 		required = [
 			"wifi_ssid", "wifi_password", "server_endpoint", "board_username",
@@ -570,6 +731,26 @@ class PowerplantManager(QWidget):
 			cfg["ota_port"] = str(int(cfg["ota_port"] or "8080"))
 		except ValueError as exc:
 			raise ValueError("OTA port must be an integer") from exc
+		return cfg
+
+	def get_artifact_values(self, cfg):
+		required = [
+			"ota_password", "firmware_channel", "firmware_download_url",
+			"firmware_artifact_dir", "firmware_manifest_file", "firmware_config_schema",
+		]
+		missing = [key for key in required if not cfg[key]]
+		if missing:
+			raise ValueError(f"Missing values for artifact generation: {', '.join(missing)}")
+		if len(cfg["ota_password"]) < 8:
+			raise ValueError("OTA password must contain at least 8 characters")
+		if cfg["firmware_channel"] not in ("stable", "prerelease"):
+			raise ValueError("Firmware channel must be stable or prerelease")
+		if not cfg["firmware_download_url"].startswith("https://"):
+			raise ValueError("Firmware download URL must use HTTPS")
+		try:
+			cfg["firmware_config_schema"] = int(cfg["firmware_config_schema"])
+		except ValueError as exc:
+			raise ValueError("Config schema must be an integer") from exc
 		return cfg
 
 	def refresh_ports(self):
@@ -652,9 +833,49 @@ class PowerplantManager(QWidget):
 			f'-DFIRMWARE_VERSION=\\"{self._escape_define_value(cfg["firmware_version"])}\\"',
 		])
 
+	def generate_artifacts(self):
+		if self.board_combo.currentText() != "Mainboard":
+			self.log("ERROR: Firmware artifacts can only be generated for Mainboard.")
+			return
+		try:
+			cfg = self.get_artifact_values(self.get_mainboard_form_values())
+			artifact_dir = resolve_project_path(cfg["firmware_artifact_dir"])
+			manifest_path = resolve_project_path(cfg["firmware_manifest_file"])
+		except (ValueError, OSError) as exc:
+			self.log(f"ERROR: {exc}")
+			return
+
+		self.upload_btn.setEnabled(False)
+		self.artifact_btn.setEnabled(False)
+		self.output_text.clear()
+		if self.monitor_thread and self.monitor_thread.isRunning():
+			self.log("--- Stopping active log monitor for artifact build ---")
+			self.stop_monitor()
+
+		self.upload_thread = PioArtifactThread(
+			self.build_mainboard_flags(cfg),
+			cfg["firmware_version"],
+			cfg["firmware_channel"],
+			cfg["firmware_download_url"],
+			artifact_dir,
+			manifest_path,
+			cfg["firmware_notes_url"],
+			cfg["firmware_config_schema"],
+		)
+		self.upload_thread.log_signal.connect(self.log)
+		self.upload_thread.finished_signal.connect(self.on_artifact_finished)
+		self.upload_thread.start()
+
+	def on_artifact_finished(self, success):
+		self.upload_btn.setEnabled(True)
+		self.artifact_btn.setEnabled(self.board_combo.currentText() == "Mainboard")
+		self.log("\\nSUCCESS: Firmware artifact generation complete." if success
+			else "\\nFAILED: Firmware artifact generation failed.")
+
 	def start_upload(self):
 		board_kind = self.board_combo.currentText()
 		self.upload_btn.setEnabled(False)
+		self.artifact_btn.setEnabled(False)
 		self.output_text.clear()
 		selected_port = self.get_selected_port()
 
@@ -712,6 +933,7 @@ class PowerplantManager(QWidget):
 
 	def on_upload_finished(self, success, env_name, board_kind, hex_uid=None, selected_type=None):
 		self.upload_btn.setEnabled(True)
+		self.artifact_btn.setEnabled(self.board_combo.currentText() == "Mainboard")
 		if success:
 			if board_kind == "Powerplant" and hex_uid and selected_type:
 				self.save_uid(hex_uid, selected_type)

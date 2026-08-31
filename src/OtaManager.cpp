@@ -2,9 +2,13 @@
 
 #include <Arduino.h>
 #include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <mbedtls/sha256.h>
 
 #include "Config.h"
 #include "DebugLog.h"
@@ -26,6 +30,31 @@ bool uploadAuthorized = false;
 bool uploadSucceeded = false;
 bool restartPending = false;
 uint32_t restartRequestedAt = 0;
+Preferences otaPreferences;
+String pullJobId;
+String pullTargetVersion;
+String pullState = "idle";
+String pullError;
+bool pullUpdateInProgress = false;
+
+String sha256Hex(const uint8_t digest[32]) {
+    String result;
+    result.reserve(64);
+    const char* digits = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        result += digits[(digest[i] >> 4) & 0x0f];
+        result += digits[digest[i] & 0x0f];
+    }
+    return result;
+}
+
+void setPullFailure(const String& message) {
+    pullState = "failed";
+    pullError = message;
+    pullUpdateInProgress = false;
+    otaPreferences.putString("state", pullState);
+    otaPreferences.putString("error", pullError);
+}
 
 bool isAuthorized() {
     if (strlen(OTA_PASSWORD) < 8 || strcmp(OTA_PASSWORD, "CHANGE_ME") == 0) {
@@ -40,8 +69,14 @@ void sendJson(int status, const String& body) {
 }
 
 void handleStatus() {
+    if (!isAuthorized()) {
+        sendJson(401, "{\"error\":\"unauthorized\"}");
+        return;
+    }
     String body = "{\"firmware_version\":\"";
     body += FIRMWARE_VERSION;
+    body += "\",\"board_id\":\"";
+    body += BOARD_USERNAME;
     body += "\",\"hostname\":\"";
     body += OTA_HOSTNAME;
     body += "\",\"ip\":\"";
@@ -50,6 +85,9 @@ void handleStatus() {
     body += updateInProgress ? "true" : "false";
     body += ",\"log_cursor\":";
     body += String(DebugLog.cursor());
+    body += ",\"ota_port\":";
+    body += String(OTA_PORT);
+    body += ",\"config_schema\":1";
     body += "}";
     sendJson(200, body);
 }
@@ -197,6 +235,24 @@ void startServer() {
 } // namespace
 
 void setupOta() {
+    otaPreferences.begin("ota_state", false);
+    pullJobId = otaPreferences.getString("job_id", "");
+    pullTargetVersion = otaPreferences.getString("version", "");
+    pullState = otaPreferences.getString("state", "idle");
+    pullError = otaPreferences.getString("error", "");
+    if (pullJobId.length() > 0 &&
+        (pullState == "downloading" || pullState == "verifying" ||
+         pullState == "installing" || pullState == "rebooting")) {
+        if (pullState == "rebooting" && pullTargetVersion == FIRMWARE_VERSION) {
+            pullState = "succeeded";
+            pullError = "";
+        } else {
+            pullState = "failed";
+            pullError = "Firmware version after reboot does not match the requested version";
+        }
+        otaPreferences.putString("state", pullState);
+        otaPreferences.putString("error", pullError);
+    }
     if (strlen(OTA_PASSWORD) < 8 || strcmp(OTA_PASSWORD, "CHANGE_ME") == 0) {
         Serial.println("[OTA] Disabled: configure an OTA password with at least 8 characters.");
         return;
@@ -219,5 +275,132 @@ void handleOta() {
 }
 
 bool isOtaInProgress() {
-    return updateInProgress;
+    return updateInProgress || pullUpdateInProgress;
 }
+
+bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
+                         const String& jobId, const String& version,
+                         uint32_t expectedSize, const String& expectedSha256,
+                         const String& path) {
+    if (pullUpdateInProgress || jobId.length() == 0 || version.length() == 0 ||
+        expectedSize == 0 || expectedSha256.length() != 64) {
+        return false;
+    }
+
+    String normalizedSha256 = expectedSha256;
+    normalizedSha256.toLowerCase();
+    pullUpdateInProgress = true;
+    pullJobId = jobId;
+    pullTargetVersion = version;
+    pullState = "downloading";
+    pullError = "";
+    otaPreferences.putString("job_id", pullJobId);
+    otaPreferences.putString("version", pullTargetVersion);
+    otaPreferences.putString("state", pullState);
+    otaPreferences.putString("error", "");
+
+    String url = apiBaseUrl;
+    if (url.endsWith("/")) url.remove(url.length() - 1);
+    url += path;
+
+    WiFiClient client;
+    HTTPClient http;
+    if (url.startsWith("https://")) {
+        if (strlen(API_CA_CERT) == 0) {
+            setPullFailure("HTTPS firmware downloads require API_CA_CERT");
+            return false;
+        }
+        if (!http.begin(url, API_CA_CERT)) {
+            setPullFailure("Could not initialize firmware download");
+            return false;
+        }
+    } else {
+        if (!http.begin(client, url)) {
+            setPullFailure("Could not initialize firmware download");
+            return false;
+        }
+    }
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    int httpCode = http.GET();
+    if (httpCode != HTTP_CODE_OK) {
+        setPullFailure("Firmware download returned HTTP " + String(httpCode));
+        http.end();
+        return false;
+    }
+    int contentLength = http.getSize();
+    if (contentLength != static_cast<int>(expectedSize)) {
+        setPullFailure("Firmware download size does not match metadata");
+        http.end();
+        return false;
+    }
+
+    if (!Update.begin(expectedSize, U_FLASH)) {
+        setPullFailure("Could not start OTA partition update");
+        http.end();
+        return false;
+    }
+
+    mbedtls_sha256_context digest;
+    mbedtls_sha256_init(&digest);
+    if (mbedtls_sha256_starts_ret(&digest, 0) != 0) {
+        mbedtls_sha256_free(&digest);
+        Update.abort();
+        setPullFailure("Could not initialize SHA-256 verification");
+        http.end();
+        return false;
+    }
+
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buffer[4096];
+    uint32_t total = 0;
+    bool valid = true;
+    while (total < expectedSize) {
+        size_t available = stream->available();
+        if (available == 0) {
+            if (!stream->connected()) {
+                valid = false;
+                break;
+            }
+            delay(2);
+            continue;
+        }
+        size_t requested = available > sizeof(buffer) ? sizeof(buffer) : available;
+        size_t count = stream->readBytes(buffer, requested);
+        if (count == 0 || total + count > expectedSize || Update.write(buffer, count) != count) {
+            valid = false;
+            break;
+        }
+        mbedtls_sha256_update_ret(&digest, buffer, count);
+        total += count;
+    }
+
+    uint8_t hash[32] = {0};
+    pullState = "verifying";
+    otaPreferences.putString("state", pullState);
+    mbedtls_sha256_finish_ret(&digest, hash);
+    mbedtls_sha256_free(&digest);
+    http.end();
+
+    if (!valid || total != expectedSize || sha256Hex(hash) != normalizedSha256) {
+        Update.abort();
+        setPullFailure("Firmware SHA-256 verification failed");
+        return false;
+    }
+    pullState = "installing";
+    otaPreferences.putString("state", pullState);
+    if (!Update.end(true)) {
+        setPullFailure("Could not finalize OTA partition update");
+        return false;
+    }
+
+    pullState = "rebooting";
+    otaPreferences.putString("state", pullState);
+    pullUpdateInProgress = false;
+    delay(100);
+    ESP.restart();
+    return true;
+}
+
+String pullOtaJobId() { return pullJobId; }
+String pullOtaState() { return pullState; }
+String pullOtaError() { return pullError; }

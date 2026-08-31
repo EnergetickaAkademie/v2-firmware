@@ -15,6 +15,10 @@
 	#define API_BASE_URL "http://192.168.1.100/coreapi"
 #endif
 
+#ifndef API_CA_CERT
+	#define API_CA_CERT ""
+#endif
+
 #ifndef BOARD_USERNAME
 	#define BOARD_USERNAME "board1"
 #endif

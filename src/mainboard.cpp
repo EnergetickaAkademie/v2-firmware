@@ -66,10 +66,12 @@ namespace {
 constexpr size_t NTAG213_USER_BYTES = 144;
 constexpr size_t INITIAL_NDEF_READ_BYTES = 32;
 constexpr uint32_t RESET_HOLD_MS = 2000;
-constexpr uint8_t ADMIN_RECORD_VERSION = 1;
+constexpr uint8_t NFC_PROTOCOL_VERSION = 2;
 constexpr uint8_t ADMIN_COMMAND_RESET_BUILDINGS = 1;
+constexpr uint8_t NDEF_TNF_EXTERNAL_TYPE = 0x04;
 
 struct NdefRecordView {
+	uint8_t tnf = 0;
 	const uint8_t* type = nullptr;
 	size_t typeLength = 0;
 	const uint8_t* payload = nullptr;
@@ -130,6 +132,7 @@ bool parseFirstNdefRecord(const uint8_t* data, size_t dataLength,
 	const size_t messageEnd = messageOffset + messageLength;
 	size_t offset = messageOffset;
 	const uint8_t header = data[offset++];
+	if ((header & 0xC0) != 0xC0) return false;  // Require one complete record.
 	if ((header & 0x20) != 0) return false;  // Chunked records are unsupported.
 	const bool shortRecord = (header & 0x10) != 0;
 	const bool hasId = (header & 0x08) != 0;
@@ -154,8 +157,9 @@ bool parseFirstNdefRecord(const uint8_t* data, size_t dataLength,
 		if (offset >= messageEnd) return false;
 		idLength = data[offset++];
 	}
-	if (offset + typeLength + idLength + payloadLength > messageEnd) return false;
+	if (offset + typeLength + idLength + payloadLength != messageEnd) return false;
 
+	record.tnf = header & 0x07;
 	record.type = data + offset;
 	record.typeLength = typeLength;
 	offset += typeLength + idLength;
@@ -164,9 +168,10 @@ bool parseFirstNdefRecord(const uint8_t* data, size_t dataLength,
 	return true;
 }
 
-bool recordTypeEquals(const NdefRecordView& record, const char* expected) {
+bool externalRecordTypeEquals(const NdefRecordView& record, const char* expected) {
 	const size_t length = strlen(expected);
-	return record.typeLength == length &&
+	return record.tnf == NDEF_TNF_EXTERNAL_TYPE &&
+		record.typeLength == length &&
 		memcmp(record.type, expected, length) == 0;
 }
 
@@ -183,7 +188,7 @@ bool readUltralightNdef(uint8_t* data, size_t& dataLength) {
 	size_t messageOffset = 0;
 	size_t messageLength = 0;
 	if (!findNdefMessage(data, dataLength, messageOffset, messageLength)) {
-		return true;  // Preserve legacy building-tag parsing.
+		return true;
 	}
 	const size_t required = messageOffset + messageLength;
 	if (required <= dataLength) {
@@ -206,7 +211,7 @@ bool readUltralightNdef(uint8_t* data, size_t& dataLength) {
 
 bool parseWifiProvisioning(const NdefRecordView& record,
 						   String& ssid, String& password, uint8_t& security) {
-	if (record.payloadLength < 9 || record.payload[0] != ADMIN_RECORD_VERSION) {
+	if (record.payloadLength < 9 || record.payload[0] != NFC_PROTOCOL_VERSION) {
 		return false;
 	}
 
@@ -441,9 +446,9 @@ void nfcTaskImpl(void *pvParameters) {
 				NdefRecordView record;
 				const bool ndefFound = parseFirstNdefRecord(data, dataLength, record);
 
-				if (ndefFound && recordTypeEquals(record, "cz.enak:cmd")) {
+				if (ndefFound && externalRecordTypeEquals(record, "cz.enak:cmd")) {
 					if (record.payloadLength == 2 &&
-						record.payload[0] == ADMIN_RECORD_VERSION &&
+						record.payload[0] == NFC_PROTOCOL_VERSION &&
 						record.payload[1] == ADMIN_COMMAND_RESET_BUILDINGS) {
 						resetArmedUid = uidStr;
 						resetArmedAtMs = millis();
@@ -458,7 +463,7 @@ void nfcTaskImpl(void *pvParameters) {
 					continue;
 				}
 
-				if (ndefFound && recordTypeEquals(record, "cz.enak:wifi")) {
+				if (ndefFound && externalRecordTypeEquals(record, "cz.enak:wifi")) {
 					String ssid;
 					String password;
 					uint8_t security = 0;
@@ -477,32 +482,14 @@ void nfcTaskImpl(void *pvParameters) {
 					continue;
 				}
 
-				bool formatFound = false;
-				uint8_t buildingType = 0;
-				if (ndefFound && recordTypeEquals(record, "B") &&
-					record.payloadLength >= 1) {
-					buildingType = record.payload[0];
-					formatFound = true;
-				}
-
-				// Backwards-compatible parser for tags written by older NFCFlasher
-				// versions, including records with an empty Android ID field.
-				for (size_t i = 0; !formatFound && i + 4 <= dataLength; i++) {
-					// Check Standard: [Type Len=1] [Payload Len=1] [Type='B'] [Payload]
-					if (data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x42) {
-						buildingType = data[i+3];
-						formatFound = true;
-						break;
-					}
-					// Check with ID Length inserted by Android: [Type Len=1] [Payload Len=1] [ID Len=0] [Type='B'] [Payload]
-					else if (i + 5 <= dataLength && data[i] == 0x01 && data[i+1] == 0x01 && data[i+2] == 0x00 && data[i+3] == 0x42) {
-						buildingType = data[i+4];
-						formatFound = true;
-						break;
-					}
-				}
-
-				if (formatFound && buildingType <= 0x11) {
+				const bool validBuildingRecord =
+					ndefFound &&
+					externalRecordTypeEquals(record, "cz.enak:building") &&
+					record.payloadLength == 2 &&
+					record.payload[0] == NFC_PROTOCOL_VERSION &&
+					record.payload[1] < BUILDING_COUNT;
+				if (validBuildingRecord) {
+					const uint8_t buildingType = record.payload[1];
 					BuildingScanQueueResult queueResult =
 						queueBuildingScan(uidStr, buildingType);
 

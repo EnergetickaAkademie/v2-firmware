@@ -21,6 +21,8 @@ unsigned long lastPostMs = 0;
 const unsigned long POST_INTERVAL = 1000;
 unsigned long lastSyncMs = 0;
 const unsigned long SYNC_INTERVAL = 500;
+unsigned long lastFirmwareSyncMs = 0;
+const unsigned long FIRMWARE_SYNC_INTERVAL = 2000;
 
 namespace {
 constexpr uint32_t STREAM_READ_TIMEOUT_MS = 3000;
@@ -31,6 +33,7 @@ constexpr uint32_t WIFI_CANDIDATE_TIMEOUT_MS = 30000;
 constexpr uint32_t BUILDING_RESET_RETRY_MS = 2000;
 bool boardRegistered = false;
 bool syncV2Available = true;
+bool firmwareModeActive = false;
 uint32_t syncV2RetryAt = 0;
 uint32_t syncSequence = 0;
 uint32_t lastConfigRevision = 0;
@@ -737,6 +740,7 @@ SyncV2Result syncBoardV2() {
     http.begin(String(API_BASE_URL) + "/board/sync/v2");
     http.addHeader("Authorization", "Bearer " + jwtToken);
     http.addHeader("Content-Type", "application/octet-stream");
+    http.addHeader("X-ENAK-Firmware-Protocol", "1");
 
     int httpCode = http.POST(requestBody, sizeof(requestBody));
     if (httpCode == HTTP_CODE_NOT_FOUND) {
@@ -784,7 +788,7 @@ SyncV2Result syncBoardV2() {
     uint8_t flags = response[3];
     uint32_t echoedSequence = readBEU32(response + 4);
     if (response[0] != 'E' || response[1] != 'A' || response[2] != 2 ||
-        (flags & ~0x01) != 0 || echoedSequence != sequence) {
+        (flags & ~0x03) != 0 || echoedSequence != sequence) {
         Serial.println("[Net] /board/sync/v2 invalid header or sequence.");
         statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         return SyncV2Result::Failed;
@@ -819,6 +823,7 @@ SyncV2Result syncBoardV2() {
     memcpy(nextCounts, response + offset, sizeof(nextCounts));
 
     const bool gameActive = (flags & 0x01) != 0;
+    firmwareModeActive = (flags & 0x02) != 0;
     bool allBuildingCountsZero = true;
     for (size_t i = 0; i < BUILDING_COUNT; ++i) {
         if (nextCounts[i] != 0) {
@@ -848,6 +853,58 @@ SyncV2Result syncBoardV2() {
     }
     statusLedRecordApiSuccess();
     return SyncV2Result::Success;
+}
+
+void syncFirmware() {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED || !boardRegistered || !firmwareModeActive) return;
+
+    JsonDocument requestDoc;
+    requestDoc["protocol"] = 1;
+    requestDoc["firmware_version"] = FIRMWARE_VERSION;
+    requestDoc["config_schema"] = 1;
+    requestDoc["ota_port"] = OTA_PORT;
+    requestDoc["state"] = pullOtaState();
+    if (pullOtaJobId().length() > 0) requestDoc["job_id"] = pullOtaJobId();
+    if (pullOtaError().length() > 0) requestDoc["error"] = pullOtaError();
+
+    String requestBody;
+    serializeJson(requestDoc, requestBody);
+
+    HTTPClient http;
+    http.begin(String(API_BASE_URL) + "/board/firmware/sync");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(requestBody);
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        JsonDocument responseDoc;
+        DeserializationError error = deserializeJson(responseDoc, payload);
+        if (!error) {
+            if (responseDoc["firmware_mode"].is<bool>() &&
+                !responseDoc["firmware_mode"].as<bool>()) {
+                firmwareModeActive = false;
+            }
+            JsonObject command = responseDoc["command"].as<JsonObject>();
+            if (!command.isNull()) {
+                String jobId = command["job_id"].as<String>();
+                String version = command["version"].as<String>();
+                String sha256 = command["sha256"].as<String>();
+                String path = command["path"].as<String>();
+                uint32_t size = command["size"].as<uint32_t>();
+                if (!installPullFirmware(String(API_BASE_URL), jwtToken, jobId, version,
+                                         size, sha256, path)) {
+                    statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+                }
+            }
+            statusLedRecordApiSuccess();
+        } else {
+            Serial.println("[Net] Firmware sync response was invalid.");
+            statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+        }
+    } else if (!handleAuthFailure(httpCode, "/board/firmware/sync")) {
+        logHttpFailure("/board/firmware/sync", httpCode);
+    }
+    http.end();
 }
 
 void postTelemetry() {
@@ -945,10 +1002,19 @@ void networkTaskImpl(void *pvParameters) {
             if (result == SyncV2Result::Success) {
                 syncV2Available = true;
             } else if (result == SyncV2Result::NotSupported) {
+                firmwareModeActive = false;
                 syncV2Available = false;
                 syncV2RetryAt = now + SYNC_V2_RETRY_INTERVAL_MS;
                 useLegacyProtocol = true;
+            } else {
+                firmwareModeActive = false;
             }
+        }
+
+        if (!useLegacyProtocol && firmwareModeActive &&
+            now - lastFirmwareSyncMs >= FIRMWARE_SYNC_INTERVAL) {
+            lastFirmwareSyncMs = now;
+            syncFirmware();
         }
 
         if (useLegacyProtocol && now - lastPollMs >= POLL_INTERVAL) {
