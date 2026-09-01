@@ -36,17 +36,14 @@ uint32_t lastCountsUpdateMs = 0;
 uint32_t lastDisplaysUpdateMs = 0;
 uint32_t lastBargraphsUpdateMs = 0;
 bool ledState = false;
-hw_timer_t *displayTimer = nullptr;
 
 PN532_I2C pn532_i2c(Wire);
 PN532 nfc(pn532_i2c);
 
-// The shift-register display chain was designed and hardware-tested at a
-// deterministic 1 kHz cadence. GPIO 38 is deliberately not registered with
-// PeripheralFactory, so this path no longer reaches LED::update()/analogWrite().
-void IRAM_ATTR onDisplayTimer() {
-	factory.update();
-}
+// Keep peripheral updates in normal loop context. PeripheralFactory::update()
+// traverses C++ containers and calls GPIO/shift-register code, so it must not
+// run from a hardware timer ISR.
+uint32_t lastPeripheralUpdateUs = 0;
 
 const char* resetReasonName(esp_reset_reason_t reason) {
 	switch (reason) {
@@ -385,6 +382,15 @@ void nfcTaskImpl(void *pvParameters) {
 	Serial.println("[NFC] Passive tag polling started.");
 
 	for (;;) {
+		// Flash writes temporarily suspend caches and need predictable access to
+		// the Wi-Fi stack. Keep the NFC/I2C task idle for the entire OTA session.
+		const bool otaActive = isOtaInProgress();
+		setOtaNfcTaskPaused(otaActive);
+		if (otaActive) {
+			vTaskDelay(pdMS_TO_TICKS(100));
+			continue;
+		}
+
 		if (consumeBuildingResetAcknowledged()) {
 			Serial.println("[NFC] Server confirmed the building reset.");
 			tone(BUZZER_PIN, 2400, 350);
@@ -573,7 +579,9 @@ void nfcTaskImpl(void *pvParameters) {
 }
 
 void startNfcTask() {
-	xTaskCreatePinnedToCore(nfcTaskImpl, "NFCTask", 8192, NULL, 1, NULL, 0);
+	const BaseType_t result = xTaskCreatePinnedToCore(
+		nfcTaskImpl, "NFCTask", 8192, NULL, 1, NULL, 0);
+	setOtaNfcTaskRunning(result == pdPASS);
 }
 
 void setup() {
@@ -700,16 +708,24 @@ void setup() {
 	gasDisplay = disp3.left();
 	windPvDisplay = disp3.right();
 
-	displayTimer = timerBegin(0, 80, true);
-	timerAttachInterrupt(displayTimer, &onDisplayTimer, false);
-	timerAlarmWrite(displayTimer, 1000, true);
-	timerAlarmEnable(displayTimer);
 }
 
 void loop() {
 	const uint32_t now = millis();
+	const uint32_t nowUs = micros();
+	if (!isOtaInProgress() &&
+		static_cast<uint32_t>(nowUs - lastPeripheralUpdateUs) >= 1000) {
+		lastPeripheralUpdateUs = nowUs;
+		factory.update();
+	}
 	statusLedUpdate();
 	handleOta();
+	if (isOtaInProgress()) {
+		// Keep the loop focused on the OTA server and status LED. In particular,
+		// avoid substation I/O and display shifting while flash is being written.
+		delay(1);
+		return;
+	}
 
 	if (now - lastCountsUpdateMs >= 200) {
 		lastCountsUpdateMs = now;

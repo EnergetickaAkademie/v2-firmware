@@ -26,11 +26,32 @@ from PyQt5.QtCore import QThread, pyqtSignal
 PROJECT_DIR = Path(__file__).resolve().parent
 UID_FILE = PROJECT_DIR / "used_uids.json"
 MAINBOARD_CONFIG_FILE = PROJECT_DIR / "uploader.conf"
+GENERATED_API_CA_CERT_HEADER = PROJECT_DIR / "src" / "GeneratedApiCaCert.h"
 
 
 def resolve_project_path(value):
 	path = Path(value).expanduser()
 	return path if path.is_absolute() else PROJECT_DIR / path
+
+
+def read_api_ca_cert(cfg):
+	certificate_file = cfg.get("api_ca_cert_file", "").strip()
+	if not certificate_file:
+		if cfg["server_endpoint"].lower().startswith("https://"):
+			raise ValueError(
+				"API CA certificate file is required when server_endpoint uses HTTPS"
+			)
+		return ""
+
+	certificate_path = resolve_project_path(certificate_file)
+	try:
+		certificate = certificate_path.read_text(encoding="utf-8").strip()
+	except OSError as exc:
+		raise ValueError(f"Could not read API CA certificate: {certificate_path}") from exc
+	if "-----BEGIN CERTIFICATE-----" not in certificate or \
+			"-----END CERTIFICATE-----" not in certificate:
+		raise ValueError(f"API CA certificate is not a PEM certificate: {certificate_path}")
+	return certificate
 
 
 def update_firmware_manifest(manifest_path, version, channel, download_url, firmware_path, notes_url, config_schema):
@@ -44,6 +65,7 @@ def update_firmware_manifest(manifest_path, version, channel, download_url, firm
 	digest = hashlib.sha256()
 	with firmware_path.open("rb") as firmware:
 		first_byte = firmware.read(1)
+		digest.update(first_byte)
 		for chunk in iter(lambda: firmware.read(1024 * 1024), b""):
 			digest.update(chunk)
 	sha256 = digest.hexdigest()
@@ -282,6 +304,7 @@ class PioMonitorThread(QThread):
 	def run(self):
 		try:
 			self.log_signal.emit(f"--- Starting serial monitor for {self.env_name} ---")
+			ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 			command = ["pio", "device", "monitor", "-e", self.env_name]
 			if self.port:
 				command.extend(["--port", self.port])
@@ -296,7 +319,7 @@ class PioMonitorThread(QThread):
 			for line in self.process.stdout:
 				if self._stop_requested:
 					break
-				self.log_signal.emit(line.rstrip())
+				self.log_signal.emit(ansi_escape.sub("", line.rstrip()))
 
 			if self.process:
 				self.process.wait()
@@ -323,11 +346,15 @@ class WifiLogThread(QThread):
 		self.port = port
 		self.password = password
 		self._stop_requested = False
+		self._session = None
 
 	def run(self):
 		log_url = f"http://{self.host}:{self.port}/ota/log"
 		status_url = f"http://{self.host}:{self.port}/ota/status"
-		headers = {"X-OTA-Password": self.password}
+		headers = {
+			"X-OTA-Password": self.password,
+			"Connection": "close",
+		}
 		cursor = 0
 		pending = ""
 		connection_error_reported = False
@@ -336,6 +363,7 @@ class WifiLogThread(QThread):
 		self.log_signal.emit(f"--- Starting Wi-Fi log from {self.host}:{self.port} ---")
 
 		with requests.Session() as session:
+			self._session = session
 			while not self._stop_requested:
 				try:
 					# Check the cursor using the non-empty status response. Calling
@@ -358,7 +386,7 @@ class WifiLogThread(QThread):
 						)
 						if response.status_code == 401:
 							self.log_signal.emit("ERROR: Wi-Fi log authentication failed.")
-							return
+							break
 						response.raise_for_status()
 
 						dropped = response.headers.get("X-Log-Dropped") == "1"
@@ -396,12 +424,15 @@ class WifiLogThread(QThread):
 					if self._stop_requested:
 						break
 					self.msleep(50)
+		self._session = None
 
 		if pending:
 			self.log_signal.emit(pending)
 
 	def stop(self):
 		self._stop_requested = True
+		if self._session is not None:
+			self._session.close()
 
 class PowerplantManager(QWidget):
 	def __init__(self):
@@ -463,6 +494,7 @@ class PowerplantManager(QWidget):
 		self.ota_password_input = QLineEdit()
 		self.ota_password_input.setEchoMode(QLineEdit.Password)
 		self.ota_hostname_input = QLineEdit("enak-mainboard")
+		self.api_ca_cert_file_input = QLineEdit()
 		self.firmware_version_input = QLineEdit("0.1.0")
 		self.firmware_channel_input = QLineEdit("stable")
 		self.firmware_download_url_input = QLineEdit()
@@ -484,6 +516,7 @@ class PowerplantManager(QWidget):
 		self.mainboard_form_layout.addRow("OTA port", self.ota_port_input)
 		self.mainboard_form_layout.addRow("OTA password", self.ota_password_input)
 		self.mainboard_form_layout.addRow("OTA hostname", self.ota_hostname_input)
+		self.mainboard_form_layout.addRow("API CA certificate file", self.api_ca_cert_file_input)
 		self.mainboard_form_layout.addRow("Firmware version", self.firmware_version_input)
 		self.mainboard_form_layout.addRow("Firmware channel", self.firmware_channel_input)
 		self.mainboard_form_layout.addRow("Firmware download URL", self.firmware_download_url_input)
@@ -576,13 +609,18 @@ class PowerplantManager(QWidget):
 
 	def stop_monitor(self):
 		if self.monitor_thread and self.monitor_thread.isRunning():
-			self.monitor_thread.stop()
-			self.monitor_thread.wait(3000)
+			thread = self.monitor_thread
+			thread.stop()
+			if not thread.wait(5000):
+				self.log("ERROR: Log monitor did not stop; upload was not started.")
+				return False
 		self.monitor_thread = None
 		self.update_upload_method_ui()
+		return True
 
 	def start_monitor(self, env_name=None):
-		self.stop_monitor()
+		if not self.stop_monitor():
+			return
 		board_kind = self.board_combo.currentText()
 		is_mainboard = board_kind == "Mainboard"
 		is_ota = is_mainboard and self.upload_method_combo.currentText() == "Wi-Fi OTA"
@@ -665,6 +703,7 @@ class PowerplantManager(QWidget):
 			"ota_port": section.get("ota_port", "8080").strip(),
 			"ota_password": section.get("ota_password", "").strip(),
 			"ota_hostname": section.get("ota_hostname", "enak-mainboard").strip(),
+			"api_ca_cert_file": section.get("api_ca_cert_file", "").strip(),
 			"firmware_version": section.get("firmware_version", "0.1.0").strip(),
 			"firmware_channel": section.get("firmware_channel", "").strip(),
 			"firmware_download_url": section.get("firmware_download_url", "").strip(),
@@ -689,6 +728,7 @@ class PowerplantManager(QWidget):
 		self.ota_port_input.setText(cfg["ota_port"])
 		self.ota_password_input.setText(cfg["ota_password"])
 		self.ota_hostname_input.setText(cfg["ota_hostname"])
+		self.api_ca_cert_file_input.setText(cfg["api_ca_cert_file"])
 		self.firmware_version_input.setText(cfg["firmware_version"])
 		self.firmware_channel_input.setText(cfg["firmware_channel"])
 		self.firmware_download_url_input.setText(cfg["firmware_download_url"])
@@ -708,6 +748,7 @@ class PowerplantManager(QWidget):
 			"ota_port": self.ota_port_input.text().strip(),
 			"ota_password": self.ota_password_input.text().strip(),
 			"ota_hostname": self.ota_hostname_input.text().strip(),
+			"api_ca_cert_file": self.api_ca_cert_file_input.text().strip(),
 			"firmware_version": self.firmware_version_input.text().strip(),
 			"firmware_channel": self.firmware_channel_input.text().strip(),
 			"firmware_download_url": self.firmware_download_url_input.text().strip(),
@@ -747,6 +788,7 @@ class PowerplantManager(QWidget):
 			raise ValueError("Firmware channel must be stable or prerelease")
 		if not cfg["firmware_download_url"].startswith("https://"):
 			raise ValueError("Firmware download URL must use HTTPS")
+		read_api_ca_cert(cfg)
 		try:
 			cfg["firmware_config_schema"] = int(cfg["firmware_config_schema"])
 		except ValueError as exc:
@@ -820,7 +862,22 @@ class PowerplantManager(QWidget):
 	def _escape_define_value(self, value):
 		return value.replace("\\", "\\\\").replace("\"", "\\\"")
 
+	def write_api_ca_cert_header(self, cfg):
+		api_ca_cert = read_api_ca_cert(cfg)
+		c_literal = (
+			api_ca_cert.replace("\\", "\\\\")
+			.replace("\"", "\\\"")
+			.replace("\r", "")
+			.replace("\n", "\\n")
+		)
+		GENERATED_API_CA_CERT_HEADER.write_text(
+			"#pragma once\n"
+			f'#define API_CA_CERT "{c_literal}"\n',
+			encoding="utf-8",
+		)
+
 	def build_mainboard_flags(self, cfg):
+		self.write_api_ca_cert_header(cfg)
 		return " ".join([
 			f'-DWIFI_SSID=\\"{self._escape_define_value(cfg["wifi_ssid"])}\\"',
 			f'-DWIFI_PASS=\\"{self._escape_define_value(cfg["wifi_password"])}\\"',
@@ -830,6 +887,7 @@ class PowerplantManager(QWidget):
 			f'-DOTA_PASSWORD=\\"{self._escape_define_value(cfg["ota_password"] or "CHANGE_ME")}\\"',
 			f'-DOTA_HOSTNAME=\\"{self._escape_define_value(cfg["ota_hostname"])}\\"',
 			f'-DOTA_PORT={cfg["ota_port"] or "8080"}',
+			'-include src/GeneratedApiCaCert.h',
 			f'-DFIRMWARE_VERSION=\\"{self._escape_define_value(cfg["firmware_version"])}\\"',
 		])
 
@@ -881,7 +939,10 @@ class PowerplantManager(QWidget):
 
 		if self.monitor_thread and self.monitor_thread.isRunning():
 			self.log("--- Stopping active log monitor for upload ---")
-			self.stop_monitor()
+			if not self.stop_monitor():
+				self.upload_btn.setEnabled(True)
+				self.artifact_btn.setEnabled(self.board_combo.currentText() == "Mainboard")
+				return
 
 		if board_kind == "Powerplant":
 			selected_type = self.type_combo.currentText()
@@ -907,7 +968,7 @@ class PowerplantManager(QWidget):
 		try:
 			cfg = self.get_mainboard_form_values()
 			build_flags = self.build_mainboard_flags(cfg)
-		except ValueError as exc:
+		except (ValueError, OSError) as exc:
 			self.log(f"ERROR: {str(exc)}")
 			self.upload_btn.setEnabled(True)
 			return

@@ -9,3 +9,5 @@ used_uids.json
 uploader.conf
 old/
 artifacts/
+certs/
+src/GeneratedApiCaCert.h

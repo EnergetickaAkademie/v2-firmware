@@ -24,9 +24,20 @@ constexpr char OTA_PATH[] = "/ota/firmware";
 constexpr char STATUS_PATH[] = "/ota/status";
 constexpr char LOG_PATH[] = "/ota/log";
 constexpr char AUTH_HEADER[] = "X-OTA-Password";
+constexpr size_t PULL_DOWNLOAD_BUFFER_SIZE = 4096;
+constexpr uint32_t LOCAL_OTA_QUIESCE_TIMEOUT_MS = 15000;
+
+// Pull OTA runs from NetworkTask. Keep the streaming buffer out of that
+// task's stack because HTTPS, HTTPClient, and SHA-256 already use substantial
+// stack space while the download is active.
+uint8_t pullDownloadBuffer[PULL_DOWNLOAD_BUFFER_SIZE];
 
 bool serverStarted = false;
 volatile bool updateInProgress = false;
+volatile bool networkTaskRunning = false;
+volatile bool networkTaskPausedForOta = false;
+volatile bool nfcTaskRunning = false;
+volatile bool nfcTaskPausedForOta = false;
 bool uploadAuthorized = false;
 bool uploadSucceeded = false;
 bool restartPending = false;
@@ -36,7 +47,7 @@ String pullJobId;
 String pullTargetVersion;
 String pullState = "idle";
 String pullError;
-bool pullUpdateInProgress = false;
+volatile bool pullUpdateInProgress = false;
 
 String sha256Hex(const uint8_t digest[32]) {
     String result;
@@ -55,6 +66,8 @@ void setPullFailure(const String& message) {
     pullUpdateInProgress = false;
     otaPreferences.putString("state", pullState);
     otaPreferences.putString("error", pullError);
+    statusLedSetOtaState(StatusOtaState::Failed);
+    Serial.printf("[OTA] Pull update failed: %s\n", message.c_str());
 }
 
 bool isAuthorized() {
@@ -153,7 +166,7 @@ void handleUploadChunk() {
     HTTPUpload& upload = otaServer.upload();
 
     if (upload.status == UPLOAD_FILE_START) {
-        if (updateInProgress) {
+        if (updateInProgress || pullUpdateInProgress) {
             uploadAuthorized = false;
             Serial.println("[OTA] Rejected concurrent firmware upload.");
             return;
@@ -168,6 +181,24 @@ void handleUploadChunk() {
 
         updateInProgress = true;
         statusLedSetOtaState(StatusOtaState::Uploading);
+        Serial.println("[OTA] Waiting for background tasks to become idle.");
+
+        const uint32_t pauseStartedAt = millis();
+        while (((networkTaskRunning && !networkTaskPausedForOta) ||
+                (nfcTaskRunning && !nfcTaskPausedForOta)) &&
+               millis() - pauseStartedAt < LOCAL_OTA_QUIESCE_TIMEOUT_MS) {
+            delay(10);
+        }
+        if ((networkTaskRunning && !networkTaskPausedForOta) ||
+            (nfcTaskRunning && !nfcTaskPausedForOta)) {
+            Serial.printf("[OTA] Background task pause timed out (network=%u, nfc=%u).\n",
+                          !networkTaskRunning || networkTaskPausedForOta ? 1 : 0,
+                          !nfcTaskRunning || nfcTaskPausedForOta ? 1 : 0);
+            updateInProgress = false;
+            statusLedSetOtaState(StatusOtaState::Failed);
+            return;
+        }
+
         Serial.printf("[OTA] Starting firmware upload: %s\n", upload.filename.c_str());
 
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
@@ -252,12 +283,17 @@ void setupOta() {
     if (pullJobId.length() > 0 &&
         (pullState == "downloading" || pullState == "verifying" ||
          pullState == "installing" || pullState == "rebooting")) {
-        if (pullState == "rebooting" && pullTargetVersion == FIRMWARE_VERSION) {
-            pullState = "succeeded";
-            pullError = "";
+        if (pullState == "rebooting") {
+            if (pullTargetVersion == FIRMWARE_VERSION) {
+                pullState = "succeeded";
+                pullError = "";
+            } else {
+                pullState = "failed";
+                pullError = "Firmware version after reboot does not match the requested version";
+            }
         } else {
             pullState = "failed";
-            pullError = "Firmware version after reboot does not match the requested version";
+            pullError = "Firmware update was interrupted before reboot";
         }
         otaPreferences.putString("state", pullState);
         otaPreferences.putString("error", pullError);
@@ -287,6 +323,24 @@ bool isOtaInProgress() {
     return updateInProgress || pullUpdateInProgress;
 }
 
+void setOtaNetworkTaskPaused(bool paused) {
+    networkTaskPausedForOta = paused;
+}
+
+void setOtaNetworkTaskRunning(bool running) {
+    networkTaskRunning = running;
+    if (!running) networkTaskPausedForOta = false;
+}
+
+void setOtaNfcTaskPaused(bool paused) {
+    nfcTaskPausedForOta = paused;
+}
+
+void setOtaNfcTaskRunning(bool running) {
+    nfcTaskRunning = running;
+    if (!running) nfcTaskPausedForOta = false;
+}
+
 bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
                          const String& jobId, const String& version,
                          uint32_t expectedSize, const String& expectedSha256,
@@ -303,6 +357,9 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
     pullTargetVersion = version;
     pullState = "downloading";
     pullError = "";
+    statusLedSetOtaState(StatusOtaState::Uploading);
+    Serial.printf("[OTA] Starting pull update to %s (%u bytes).\n",
+                  version.c_str(), static_cast<unsigned>(expectedSize));
     otaPreferences.putString("job_id", pullJobId);
     otaPreferences.putString("version", pullTargetVersion);
     otaPreferences.putString("state", pullState);
@@ -311,6 +368,7 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
     String url = apiBaseUrl;
     if (url.endsWith("/")) url.remove(url.length() - 1);
     url += path;
+    Serial.printf("[OTA] Pull download URL: %s\n", url.c_str());
 
     WiFiClient client;
     HTTPClient http;
@@ -329,11 +387,27 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
             return false;
         }
     }
+    // The firmware download is a separate connection from the regular sync
+    // request. Do not reuse a stale keep-alive socket, and allow enough time
+    // for a cloud HTTPS endpoint to establish and serve the image.
+    http.setReuse(false);
+    http.setConnectTimeout(15000);
+    http.setTimeout(30000);
     http.addHeader("Authorization", "Bearer " + jwtToken);
     int httpCode = http.GET();
     if (httpCode != HTTP_CODE_OK) {
-        setPullFailure("Firmware download returned HTTP " + String(httpCode));
+        String failure = "Firmware download returned ";
+        if (httpCode < 0) {
+            failure += HTTPClient::errorToString(httpCode);
+            failure += " (";
+            failure += String(httpCode);
+            failure += ")";
+        } else {
+            failure += "HTTP ";
+            failure += String(httpCode);
+        }
         http.end();
+        setPullFailure(failure);
         return false;
     }
     int contentLength = http.getSize();
@@ -360,7 +434,7 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
     }
 
     WiFiClient* stream = http.getStreamPtr();
-    uint8_t buffer[4096];
+    uint8_t* buffer = pullDownloadBuffer;
     uint32_t total = 0;
     bool valid = true;
     while (total < expectedSize) {
@@ -373,7 +447,9 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
             delay(2);
             continue;
         }
-        size_t requested = available > sizeof(buffer) ? sizeof(buffer) : available;
+        size_t requested = available > PULL_DOWNLOAD_BUFFER_SIZE
+                               ? PULL_DOWNLOAD_BUFFER_SIZE
+                               : available;
         size_t count = stream->readBytes(buffer, requested);
         if (count == 0 || total + count > expectedSize || Update.write(buffer, count) != count) {
             valid = false;
@@ -386,6 +462,7 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
     uint8_t hash[32] = {0};
     pullState = "verifying";
     otaPreferences.putString("state", pullState);
+    Serial.println("[OTA] Pull download complete; verifying SHA-256.");
     mbedtls_sha256_finish_ret(&digest, hash);
     mbedtls_sha256_free(&digest);
     http.end();
@@ -405,6 +482,7 @@ bool installPullFirmware(const String& apiBaseUrl, const String& jwtToken,
     pullState = "rebooting";
     otaPreferences.putString("state", pullState);
     pullUpdateInProgress = false;
+    Serial.println("[OTA] Pull update installed; rebooting.");
     delay(100);
     ESP.restart();
     return true;

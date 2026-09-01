@@ -27,7 +27,9 @@ void ARDUINO_ISR_ATTR remoteDebugPutc(char value) {
 	if (xPortInIsrContext()) return;
 
 	const uint8_t byte = static_cast<uint8_t>(value);
-	Serial.write(byte);
+	// The ESP-IDF primary console already writes core logs to Serial. This hook
+	// is the secondary output used by the Wi-Fi log, so writing to Serial here
+	// would duplicate every byte on the USB monitor.
 	appendToLogBuffer(&byte, 1);
 }
 } // namespace

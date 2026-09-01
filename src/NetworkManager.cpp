@@ -956,7 +956,9 @@ void networkTaskImpl(void *pvParameters) {
     for (;;) {
         unsigned long now = millis();
 
-        if (isOtaInProgress()) {
+        const bool otaActive = isOtaInProgress();
+        setOtaNetworkTaskPaused(otaActive);
+        if (otaActive) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -1058,7 +1060,11 @@ void networkTaskImpl(void *pvParameters) {
 }
 
 void startNetworkTask() {
-    xTaskCreatePinnedToCore(networkTaskImpl, "NetworkTask", 8192, NULL, 1, NULL, 0);
+    // Network operations may combine HTTPS, JSON parsing, and pull-OTA
+    // processing. Keep enough headroom for those nested calls.
+    const BaseType_t result = xTaskCreatePinnedToCore(
+        networkTaskImpl, "NetworkTask", 12288, NULL, 1, NULL, 0);
+    setOtaNetworkTaskRunning(result == pdPASS);
     Serial.println("[Net] Network Task started on Core 0");
 }
 
