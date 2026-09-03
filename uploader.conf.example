@@ -9,6 +9,8 @@ server_endpoint = http://enak.server.example/coreapi
 
 board_username = board_usr
 board_password = board_pwd
+# Set false to build a board that only uses /board/sync/v2.
+mqtt_v3_enabled = true
 
 # Required to enable the mainboard's authenticated HTTP OTA endpoint.
 # The first OTA-capable firmware must still be installed over USB.

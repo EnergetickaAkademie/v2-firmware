@@ -10,11 +10,14 @@ constexpr uint32_t MOTOR_PIN_B = PC3;
 constexpr uint32_t SOLAR_RGB_PIN = PD0;
 constexpr uint32_t SOLAR_ADC_PIN = PA1;
 
-constexpr uint8_t MOTOR_START_PERCENT = 15;
-constexpr uint8_t MOTOR_STOP_PERCENT = 10;
-constexpr uint8_t MOTOR_MIN_DUTY = 100;
-constexpr uint8_t MOTOR_MAX_DUTY = 255;
-constexpr uint32_t MOTOR_KICK_MS = 300;
+// The percent byte in CMD_MOTOR_ON is retained for protocol compatibility,
+// but it is not used as a speed command. Wind motors receive a short
+// full-power kick for reliable starting, then run at a fixed reduced duty to
+// limit continuous current and voltage drop in the power distribution path.
+constexpr uint8_t MOTOR_FULL_DUTY = 255;
+constexpr uint8_t WIND_MOTOR_RUN_DUTY = 100;
+constexpr uint32_t WIND_MOTOR_KICK_MS = 300;
+constexpr uint8_t NEBULIZER_DUTY = 255;
 constexpr uint32_t NEBULIZER_COOLDOWN_MS = 5000;
 constexpr uint32_t ACTUATOR_COMMAND_TIMEOUT_MS = 2500;
 
@@ -47,8 +50,8 @@ bool actuator_command_received = false;
 uint32_t last_actuator_command_ms = 0;
 
 bool motor_running = false;
-bool motor_kicking = false;
-uint32_t motor_kick_started_ms = 0;
+bool wind_motor_kicking = false;
+uint32_t wind_motor_kick_started_ms = 0;
 
 bool nebulizer_running = false;
 bool nebulizer_cooling_down = false;
@@ -77,41 +80,46 @@ bool hasActuator() {
 void setDriverDuty(uint8_t duty) {
 	if (driver_duty == duty) return;
 	driver_duty = duty;
+
+	// Keep the motor pin under timer control on the CH32 Arduino core. Duty 0
+	// and 255 produce constant output levels; intermediate wind-motor values
+	// use PWM at the frequency configured in setup().
 	analogWrite(MOTOR_PIN_A, duty);
 	analogWrite(MOTOR_PIN_B, 0);
 }
 
-uint8_t motorDutyForPercent(uint8_t percent) {
-	if (percent <= MOTOR_START_PERCENT) return MOTOR_MIN_DUTY;
-	const uint16_t scaled = static_cast<uint16_t>(percent - MOTOR_START_PERCENT) *
-		(MOTOR_MAX_DUTY - MOTOR_MIN_DUTY);
-	return MOTOR_MIN_DUTY + scaled / (100 - MOTOR_START_PERCENT);
-}
-
 void updateVariableMotor(uint32_t now) {
-	if (motor_running && requested_actuator_percent < MOTOR_STOP_PERCENT) {
-		motor_running = false;
-		motor_kicking = false;
-		setDriverDuty(0);
+	if (requested_actuator_percent == 0) {
+		if (motor_running) {
+			motor_running = false;
+			wind_motor_kicking = false;
+			setDriverDuty(0);
+		}
 		return;
 	}
 
 	if (!motor_running) {
-		if (requested_actuator_percent < MOTOR_START_PERCENT) return;
 		motor_running = true;
-		motor_kicking = true;
-		motor_kick_started_ms = now;
-		setDriverDuty(MOTOR_MAX_DUTY);
+
+		if (DEVICE_TYPE == TYPE_WIND) {
+			wind_motor_kicking = true;
+			wind_motor_kick_started_ms = now;
+			setDriverDuty(MOTOR_FULL_DUTY);
+			return;
+		}
+	}
+
+	if (DEVICE_TYPE == TYPE_WIND) {
+		if (wind_motor_kicking) {
+			if (now - wind_motor_kick_started_ms < WIND_MOTOR_KICK_MS) return;
+			wind_motor_kicking = false;
+		}
+
+		setDriverDuty(WIND_MOTOR_RUN_DUTY);
 		return;
 	}
 
-	if (motor_kicking) {
-		if (now - motor_kick_started_ms < MOTOR_KICK_MS) return;
-		motor_kicking = false;
-	}
-
-	const uint8_t running_percent = max(requested_actuator_percent, MOTOR_START_PERCENT);
-	setDriverDuty(motorDutyForPercent(running_percent));
+	setDriverDuty(MOTOR_FULL_DUTY);
 }
 
 void updateNebulizer(uint32_t now) {
@@ -133,7 +141,7 @@ void updateNebulizer(uint32_t now) {
 	}
 
 	nebulizer_running = true;
-	setDriverDuty(MOTOR_MAX_DUTY);
+	setDriverDuty(NEBULIZER_DUTY);
 }
 
 void updateActuator(uint32_t now) {
@@ -234,7 +242,7 @@ void setup() {
 	digitalWrite(POWERPLANT_STATUS_LED_PIN, LOW);
 
 	analogWriteResolution(8);
-	analogWriteFrequency(1000);
+	analogWriteFrequency(50);
 	pinMode(MOTOR_PIN_A, OUTPUT);
 	pinMode(MOTOR_PIN_B, OUTPUT);
 	analogWrite(MOTOR_PIN_A, 0);

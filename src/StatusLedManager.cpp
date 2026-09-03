@@ -34,6 +34,7 @@ struct SharedStatus {
     bool wifiConnected = false;
     bool wifiEverConnected = false;
     bool boardRegistered = false;
+    bool mqttHealthy = false;
     bool apiEverSucceeded = false;
     bool nfcKnown = false;
     bool nfcAvailable = false;
@@ -174,6 +175,11 @@ void statusLedUpdate() {
         return;
     }
 
+    if (status.mqttHealthy) {
+        render(CYAN);
+        return;
+    }
+
     const uint32_t nfcEventAge = now - status.nfcEventSinceMs;
     if (status.nfcEvent != StatusNfcEvent::None && nfcEventAge < NFC_EVENT_MS) {
         const bool on = doubleFlashOn(nfcEventAge, NFC_EVENT_MS);
@@ -220,6 +226,12 @@ void statusLedSetWifiConnected(bool connected) {
 void statusLedSetBoardRegistered(bool registered) {
     portENTER_CRITICAL(&statusMux);
     sharedStatus.boardRegistered = registered;
+    portEXIT_CRITICAL(&statusMux);
+}
+
+void statusLedSetMqttHealthy(bool healthy) {
+    portENTER_CRITICAL(&statusMux);
+    sharedStatus.mqttHealthy = healthy;
     portEXIT_CRITICAL(&statusMux);
 }
 

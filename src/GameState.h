@@ -34,9 +34,13 @@ extern uint8_t authoritativeBuildingCounts[BUILDING_COUNT];
 struct PendingBuilding {
 	String uid;
 	uint8_t type;
+	uint32_t eventId;
+	PendingBuilding(const String& value, uint8_t buildingType)
+		: uid(value), type(buildingType), eventId(0) {}
 };
 extern std::vector<PendingBuilding> pendingBuildings;
 extern SemaphoreHandle_t pendingMutex;
+void persistPendingBuildingQueue();
 
 enum class BuildingScanQueueResult {
 	Queued,

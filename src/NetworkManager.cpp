@@ -10,6 +10,7 @@
 #include "OtaManager.h"
 #include "RuntimeConfig.h"
 #include "StatusLedManager.h"
+#include "MqttTransport.h"
 
 #define Serial DebugLog
 
@@ -38,6 +39,15 @@ bool firmwareModeActive = false;
 uint32_t syncV2RetryAt = 0;
 uint32_t syncSequence = 0;
 uint32_t lastConfigRevision = 0;
+String mqttBootstrapUri;
+uint32_t mqttBootstrapRetryAt = 0;
+bool mqttBootstrapAttempted = false;
+uint32_t mqttDisconnectedSince = 0;
+
+bool handleAuthFailure(int httpCode, const char* endpoint);
+void logHttpFailure(const char* endpoint,
+                    int httpCode,
+                    StatusApiError statusError = StatusApiError::None);
 
 Preferences wifiPreferences;
 SemaphoreHandle_t wifiConfigMutex = nullptr;
@@ -77,6 +87,55 @@ void addBoardMetadata(HTTPClient& http) {
     http.addHeader("X-ENAK-Config-Schema", String(runtimeConfigSchema()));
 }
 
+bool mqttV3Enabled() {
+    return ENAK_MQTT_V3_ENABLED != 0;
+}
+
+bool bootstrapMqtt(uint32_t now) {
+    if (!mqttV3Enabled() || jwtToken == "" || !boardRegistered ||
+        WiFi.status() != WL_CONNECTED ||
+        static_cast<int32_t>(now - mqttBootstrapRetryAt) < 0) return false;
+
+    // A successful bootstrap owns a reconnecting esp-mqtt client. Do not tear
+    // that client down and repeat the HTTPS bootstrap every 30 seconds.
+    if (mqttBootstrapAttempted) return mqttTransportConnected();
+
+    HTTPClient http;
+    const String bootstrapUrl = runtimeApiBaseUrl() + "/board/bootstrap/v3";
+    Serial.printf("[MQTT] Requesting bootstrap from %s.\n", bootstrapUrl.c_str());
+    http.begin(bootstrapUrl);
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    const int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+        JsonDocument document;
+        const DeserializationError error = deserializeJson(document, http.getString());
+        const String uri = error ? String() : document["mqtt_uri"].as<String>();
+        const String root = error ? String() : document["topic_root"].as<String>();
+        const int protocol = error ? 0 : document["protocol"].as<int>();
+        if (!error && protocol == 3 && uri.startsWith("ws") && root.length() > 0) {
+            Serial.printf("[MQTT] Bootstrap accepted: protocol=%d uri=%s topic=%s.\n",
+                          protocol, uri.c_str(), root.c_str());
+            mqttBootstrapUri = uri;
+            mqttBootstrapAttempted = mqttTransportStart(mqttBootstrapUri);
+            mqttBootstrapRetryAt = now + (mqttBootstrapAttempted ? 30000 : 5000);
+            http.end();
+            return mqttBootstrapAttempted;
+        }
+        Serial.println("[MQTT] Bootstrap response was incomplete or unusable.");
+        statusLedRecordApiFailure(StatusApiError::InvalidResponse);
+        mqttBootstrapRetryAt = now + 30000;
+    } else {
+        if (handleAuthFailure(code, "/board/bootstrap/v3")) {
+            http.end();
+            return false;
+        }
+        logHttpFailure("/board/bootstrap/v3", code);
+        mqttBootstrapRetryAt = now + (code == HTTP_CODE_SERVICE_UNAVAILABLE ? 5000 : 30000);
+    }
+    http.end();
+    return false;
+}
+
 void beginWifiConnection(const String& ssid, const String& password, uint8_t security) {
     if (security == 0) {
         WiFi.begin(ssid.c_str());
@@ -89,6 +148,8 @@ void clearAuthenticationState() {
     jwtToken = "";
     boardRegistered = false;
     statusLedSetBoardRegistered(false);
+    mqttTransportStop();
+    mqttBootstrapAttempted = false;
 }
 
 bool readCandidateWifi(String& ssid, String& password, uint8_t& security,
@@ -273,7 +334,7 @@ int32_t readBE32(const uint8_t* source) {
 
 void logHttpFailure(const char* endpoint,
                     int httpCode,
-                    StatusApiError statusError = StatusApiError::None) {
+                    StatusApiError statusError) {
     if (httpCode < 0) {
         Serial.printf("[Net] %s failed: %s (%d)\n",
                       endpoint,
@@ -315,7 +376,7 @@ void processPendingBuildingUpload(uint32_t now) {
     if (isBuildingResetPending()) return;
     if (now - lastAttemptMs < 2000) return;
 
-    PendingBuilding pending;
+    PendingBuilding pending("", 0);
     bool hasPending = false;
 
     if (xSemaphoreTake(pendingMutex, 0) == pdTRUE) {
@@ -334,14 +395,17 @@ void processPendingBuildingUpload(uint32_t now) {
         return;
     }
 
+    bool removed = false;
     if (xSemaphoreTake(pendingMutex, portMAX_DELAY) == pdTRUE) {
         if (!pendingBuildings.empty() &&
             pendingBuildings.front().uid == pending.uid &&
             pendingBuildings.front().type == pending.type) {
             pendingBuildings.erase(pendingBuildings.begin());
+            removed = true;
         }
         xSemaphoreGive(pendingMutex);
     }
+    if (removed) persistPendingBuildingQueue();
 
     Serial.println("[Net] Queued building confirmed by server.");
 }
@@ -991,6 +1055,7 @@ void networkTaskImpl(void *pvParameters) {
                 Serial.println("[Net] Attempting API Authentication...");
                 if (authenticate()) {
                     registerBoard();
+                    mqttBootstrapRetryAt = now;
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1002,6 +1067,7 @@ void networkTaskImpl(void *pvParameters) {
                 lastNetworkRetry = now;
                 Serial.println("[Net] Attempting board re-registration...");
                 registerBoard();
+                mqttBootstrapRetryAt = now;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -1012,58 +1078,88 @@ void networkTaskImpl(void *pvParameters) {
             continue;
         }
 
-        bool useLegacyProtocol = !syncV2Available &&
-                                 static_cast<int32_t>(now - syncV2RetryAt) < 0;
+        bootstrapMqtt(now);
+        mqttTransportTick(now);
 
-        if (!useLegacyProtocol && now - lastSyncMs >= SYNC_INTERVAL) {
-            lastSyncMs = now;
-            SyncV2Result result = syncBoardV2();
-            if (result == SyncV2Result::Success) {
-                syncV2Available = true;
-            } else if (result == SyncV2Result::NotSupported) {
-                firmwareModeActive = false;
-                syncV2Available = false;
-                syncV2RetryAt = now + SYNC_V2_RETRY_INTERVAL_MS;
-                useLegacyProtocol = true;
-            } else {
-                firmwareModeActive = false;
+        // esp-mqtt normally reconnects by itself. Rebuild a client whose
+        // reconnect loop has remained stuck for a full minute instead of
+        // requiring a physical board reboot.
+        if (mqttBootstrapAttempted && !mqttTransportConnected()) {
+            if (mqttDisconnectedSince == 0) mqttDisconnectedSince = now;
+            if (now - mqttDisconnectedSince >= 60000) {
+                Serial.println("[MQTT] Reconnect stalled; rebuilding the MQTT client.");
+                mqttTransportStop();
+                mqttBootstrapAttempted = false;
+                mqttBootstrapRetryAt = now + 1000;
+                mqttDisconnectedSince = 0;
             }
+        } else {
+            mqttDisconnectedSince = 0;
         }
 
-        if (!useLegacyProtocol && firmwareModeActive &&
-            now - lastFirmwareSyncMs >= FIRMWARE_SYNC_INTERVAL) {
-            lastFirmwareSyncMs = now;
-            syncFirmware();
+        const bool mqttReady = mqttTransportReady();
+        if (!mqttReady) {
+            // Preserve the pre-MQTT fallback state machine: prefer the compact
+            // 500 ms HTTP v2 sync, and use the legacy multi-request protocol
+            // only while v2 is known to be unavailable.
+            bool useLegacyProtocol = !syncV2Available &&
+                                     static_cast<int32_t>(now - syncV2RetryAt) < 0;
+
+            if (!useLegacyProtocol && now - lastSyncMs >= SYNC_INTERVAL) {
+                lastSyncMs = now;
+                SyncV2Result result = syncBoardV2();
+                if (result == SyncV2Result::Success) {
+                    syncV2Available = true;
+                } else if (result == SyncV2Result::NotSupported) {
+                    firmwareModeActive = false;
+                    syncV2Available = false;
+                    syncV2RetryAt = now + SYNC_V2_RETRY_INTERVAL_MS;
+                    useLegacyProtocol = true;
+                } else {
+                    firmwareModeActive = false;
+                }
+            }
+
+            if (!useLegacyProtocol && firmwareModeActive &&
+                now - lastFirmwareSyncMs >= FIRMWARE_SYNC_INTERVAL) {
+                lastFirmwareSyncMs = now;
+                syncFirmware();
+            }
+
+            if (useLegacyProtocol && now - lastPollMs >= POLL_INTERVAL) {
+                lastPollMs = now;
+                pollGameState();
+
+                // A previous request may have invalidated the token.
+                if (jwtToken != "") pollProductionRanges();
+                if (jwtToken != "") pollConsumptionValues();
+                if (jwtToken != "") pollBuildingCounts();
+            }
+
+            if (useLegacyProtocol && jwtToken != "" && now - lastPostMs >= POST_INTERVAL) {
+                lastPostMs = now;
+                postTelemetry();
+            }
+
+            // Keep all HTTP operations on this task. This avoids concurrent
+            // HTTP/JWT access from the Arduino loop task when NFC buildings
+            // are queued.
+            processPendingBuildingUpload(now);
         }
-
-        if (useLegacyProtocol && now - lastPollMs >= POLL_INTERVAL) {
-            lastPollMs = now;
-            pollGameState();
-
-            // A previous request may have invalidated the token.
-            if (jwtToken != "") pollProductionRanges();
-            if (jwtToken != "") pollConsumptionValues();
-            if (jwtToken != "") pollBuildingCounts();
-        }
-
-        if (useLegacyProtocol && jwtToken != "" && now - lastPostMs >= POST_INTERVAL) {
-            lastPostMs = now;
-            postTelemetry();
-        }
-
-        // Keep all HTTP operations on this task. This avoids concurrent HTTP/JWT
-        // access from the Arduino loop task when NFC buildings are queued.
-        processPendingBuildingUpload(now);
 
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+void applyMqttFirmwareMode(bool active) {
+    firmwareModeActive = active;
 }
 
 void startNetworkTask() {
     // Network operations may combine HTTPS, JSON parsing, and pull-OTA
     // processing. Keep enough headroom for those nested calls.
     const BaseType_t result = xTaskCreatePinnedToCore(
-        networkTaskImpl, "NetworkTask", 12288, NULL, 1, NULL, 0);
+        networkTaskImpl, "NetworkTask", 16384, NULL, 1, NULL, 0);
     setOtaNetworkTaskRunning(result == pdPASS);
     Serial.println("[Net] Network Task started on Core 0");
 }

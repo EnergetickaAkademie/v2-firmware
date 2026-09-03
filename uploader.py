@@ -502,6 +502,8 @@ class PowerplantManager(QWidget):
 		self.firmware_manifest_file_input = QLineEdit()
 		self.firmware_notes_url_input = QLineEdit()
 		self.firmware_config_schema_input = QLineEdit("1")
+		self.mqtt_v3_checkbox = QCheckBox("Prefer MQTT v3 (automatic HTTP v2 fallback)")
+		self.mqtt_v3_checkbox.setChecked(True)
 
 		self.show_passwords_checkbox = QCheckBox("Show passwords")
 		self.show_passwords_checkbox.toggled.connect(self.on_show_passwords_toggled)
@@ -511,6 +513,7 @@ class PowerplantManager(QWidget):
 		self.mainboard_form_layout.addRow("Server Endpoint", self.server_endpoint_input)
 		self.mainboard_form_layout.addRow("Board Username", self.board_username_input)
 		self.mainboard_form_layout.addRow("Board Password", self.board_password_input)
+		self.mainboard_form_layout.addRow("Communication", self.mqtt_v3_checkbox)
 		self.mainboard_form_layout.addRow("Upload method", self.upload_method_combo)
 		self.mainboard_form_layout.addRow("OTA host / IP", self.ota_host_input)
 		self.mainboard_form_layout.addRow("OTA port", self.ota_port_input)
@@ -699,6 +702,7 @@ class PowerplantManager(QWidget):
 			"server_endpoint": section.get("server_endpoint").strip(),
 			"board_username": section.get("board_username").strip(),
 			"board_password": section.get("board_password").strip(),
+			"mqtt_v3_enabled": section.getboolean("mqtt_v3_enabled", fallback=True),
 			"ota_host": section.get("ota_host", "").strip(),
 			"ota_port": section.get("ota_port", "8080").strip(),
 			"ota_password": section.get("ota_password", "").strip(),
@@ -724,6 +728,7 @@ class PowerplantManager(QWidget):
 		self.server_endpoint_input.setText(cfg["server_endpoint"])
 		self.board_username_input.setText(cfg["board_username"])
 		self.board_password_input.setText(cfg["board_password"])
+		self.mqtt_v3_checkbox.setChecked(cfg["mqtt_v3_enabled"])
 		self.ota_host_input.setText(cfg["ota_host"])
 		self.ota_port_input.setText(cfg["ota_port"])
 		self.ota_password_input.setText(cfg["ota_password"])
@@ -744,6 +749,7 @@ class PowerplantManager(QWidget):
 			"server_endpoint": self.server_endpoint_input.text().strip(),
 			"board_username": self.board_username_input.text().strip(),
 			"board_password": self.board_password_input.text().strip(),
+			"mqtt_v3_enabled": self.mqtt_v3_checkbox.isChecked(),
 			"ota_host": self.ota_host_input.text().strip(),
 			"ota_port": self.ota_port_input.text().strip(),
 			"ota_password": self.ota_password_input.text().strip(),
@@ -887,6 +893,7 @@ class PowerplantManager(QWidget):
 			f'-DOTA_PASSWORD=\\"{self._escape_define_value(cfg["ota_password"] or "CHANGE_ME")}\\"',
 			f'-DOTA_HOSTNAME=\\"{self._escape_define_value(cfg["ota_hostname"])}\\"',
 			f'-DOTA_PORT={cfg["ota_port"] or "8080"}',
+			f'-DENAK_MQTT_V3_ENABLED={1 if cfg["mqtt_v3_enabled"] else 0}',
 			'-include src/GeneratedApiCaCert.h',
 			f'-DFIRMWARE_VERSION=\\"{self._escape_define_value(cfg["firmware_version"])}\\"',
 		])

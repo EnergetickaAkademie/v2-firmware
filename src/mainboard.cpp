@@ -36,14 +36,60 @@ uint32_t lastCountsUpdateMs = 0;
 uint32_t lastDisplaysUpdateMs = 0;
 uint32_t lastBargraphsUpdateMs = 0;
 bool ledState = false;
+hw_timer_t *peripheralTimer = nullptr;
+TaskHandle_t peripheralRefreshTaskHandle = nullptr;
 
 PN532_I2C pn532_i2c(Wire);
 PN532 nfc(pn532_i2c);
 
-// Keep peripheral updates in normal loop context. PeripheralFactory::update()
-// traverses C++ containers and calls GPIO/shift-register code, so it must not
-// run from a hardware timer ISR.
-uint32_t lastPeripheralUpdateUs = 0;
+// PeripheralFactory traverses C++ objects and performs GPIO/shift-register
+// work. It is not ISR-safe. Calling it from a hardware timer can corrupt state
+// or trigger an interrupt watchdog reset, which looks like a random network
+// disconnect from the server. The hardware timer below only wakes a normal task;
+// it does not call the library from interrupt context. This preserves the
+// hardware-tested 1 kHz cadence while keeping the C++/GPIO work out of the ISR.
+// The input and output chains share a clock pin, so both remain serialized
+// through this one factory update.
+void IRAM_ATTR onPeripheralTimer() {
+	if (peripheralRefreshTaskHandle == nullptr) return;
+
+	BaseType_t higherPriorityTaskWoken = pdFALSE;
+	vTaskNotifyGiveFromISR(peripheralRefreshTaskHandle, &higherPriorityTaskWoken);
+	if (higherPriorityTaskWoken == pdTRUE) {
+		portYIELD_FROM_ISR();
+	}
+}
+
+void peripheralTaskImpl(void *pvParameters) {
+	for (;;) {
+		// The timer provides the cadence. Clearing all pending notifications after
+		// each wake prevents a delayed task from trying to replay stale scans.
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		if (!isOtaInProgress()) {
+			factory.update();
+		}
+	}
+}
+
+void startPeripheralTask() {
+	const BaseType_t result = xTaskCreatePinnedToCore(
+		peripheralTaskImpl, "PeripheralTask", 4096, NULL, 2,
+		&peripheralRefreshTaskHandle, 1);
+	if (result != pdPASS) {
+		Serial.println("[Main] Failed to start the peripheral refresh task.");
+		return;
+	}
+
+	// Timer 0 at 1 MHz: one alarm every 1000 us = 1 kHz refresh.
+	peripheralTimer = timerBegin(0, 80, true);
+	if (peripheralTimer == nullptr) {
+		Serial.println("[Main] Failed to initialize the peripheral refresh timer.");
+		return;
+	}
+	timerAttachInterrupt(peripheralTimer, &onPeripheralTimer, false);
+	timerAlarmWrite(peripheralTimer, 1000, true);
+	timerAlarmEnable(peripheralTimer);
+}
 
 const char* resetReasonName(esp_reset_reason_t reason) {
 	switch (reason) {
@@ -708,16 +754,11 @@ void setup() {
 	gasDisplay = disp3.left();
 	windPvDisplay = disp3.right();
 
+	startPeripheralTask();
 }
 
 void loop() {
 	const uint32_t now = millis();
-	const uint32_t nowUs = micros();
-	if (!isOtaInProgress() &&
-		static_cast<uint32_t>(nowUs - lastPeripheralUpdateUs) >= 1000) {
-		lastPeripheralUpdateUs = nowUs;
-		factory.update();
-	}
 	statusLedUpdate();
 	handleOta();
 	if (isOtaInProgress()) {

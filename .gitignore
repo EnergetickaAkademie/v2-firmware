@@ -10,4 +10,6 @@ uploader.conf
 old/
 artifacts/
 certs/
+!certs/
+!certs/isrgrootx1.pem
 src/GeneratedApiCaCert.h

@@ -35,6 +35,20 @@ uint32_t buildingResetReadyAtMs = 0;
 
 constexpr const char* BOARD_STATE_NAMESPACE = "board_state";
 constexpr const char* RESET_PENDING_KEY = "reset_pending";
+constexpr const char* NFC_OUTBOX_NAMESPACE = "nfc_outbox";
+
+void persistPendingBuildingQueueLocked() {
+	Preferences preferences;
+	if (!preferences.begin(NFC_OUTBOX_NAMESPACE, false)) return;
+	preferences.putUInt("count", pendingBuildings.size());
+	for (size_t i = 0; i < pendingBuildings.size(); ++i) {
+		String index = String(i);
+		preferences.putString(("uid" + index).c_str(), pendingBuildings[i].uid);
+		preferences.putUChar(("type" + index).c_str(), pendingBuildings[i].type);
+		preferences.putUInt(("event" + index).c_str(), pendingBuildings[i].eventId);
+	}
+	preferences.end();
+}
 
 void persistResetPending(bool pending) {
 	Preferences preferences;
@@ -56,6 +70,25 @@ void initPersistentGameState() {
 	const bool pending = preferences.getBool(RESET_PENDING_KEY, false);
 	preferences.end();
 
+	Preferences outbox;
+	uint32_t outboxCount = 0;
+	if (!pending && outbox.begin(NFC_OUTBOX_NAMESPACE, true)) {
+		outboxCount = outbox.getUInt("count", 0);
+		if (outboxCount > 32) outboxCount = 0;
+		for (uint32_t i = 0; i < outboxCount; ++i) {
+			String index = String(i);
+			String uid = outbox.getString(("uid" + index).c_str(), "");
+			uint8_t type = outbox.getUChar(("type" + index).c_str(), 255);
+			uint32_t eventId = outbox.getUInt(("event" + index).c_str(), 0);
+			if (uid.length() > 0 && uid.length() <= 64 && type < BUILDING_COUNT) {
+				scannedBuildings.push_back({uid, type});
+				pendingBuildings.push_back(PendingBuilding(uid, type));
+				pendingBuildings.back().eventId = eventId;
+			}
+		}
+		outbox.end();
+	}
+
 	if (pendingMutex == nullptr ||
 		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
 		return;
@@ -67,6 +100,10 @@ void initPersistentGameState() {
 		pendingBuildings.clear();
 	}
 	xSemaphoreGive(pendingMutex);
+	if (outboxCount > 0) {
+		Serial.printf("[NFC] Restored %u MQTT building event(s) from NVS.\n",
+			static_cast<unsigned>(outboxCount));
+	}
 
 	if (pending) {
 		Serial.println("[NFC] Restored pending building reset; server update will retry after reconnect.");
@@ -98,7 +135,8 @@ BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type) {
 
 		if (result == BuildingScanQueueResult::Queued) {
 			scannedBuildings.push_back({uid, type});
-			pendingBuildings.push_back({uid, type});
+			pendingBuildings.push_back(PendingBuilding(uid, type));
+			persistPendingBuildingQueueLocked();
 		}
 	}
 
@@ -141,6 +179,7 @@ void setBuildingScanScenarioState(bool active, bool resetCache) {
 	xSemaphoreGive(pendingMutex);
 
 	if (clearedState) {
+		persistPendingBuildingQueue();
 		Serial.println("[NFC] Cleared local scan state at scenario boundary.");
 	}
 }
@@ -158,6 +197,7 @@ void requestBuildingReset() {
 	pendingBuildings.clear();
 	memset(authoritativeBuildingCounts, 0, sizeof(authoritativeBuildingCounts));
 	xSemaphoreGive(pendingMutex);
+	persistPendingBuildingQueue();
 
 	persistResetPending(true);
 	Serial.println("[NFC] Building reset accepted locally; waiting for server confirmation.");
@@ -197,4 +237,10 @@ bool consumeBuildingResetAcknowledged() {
 	buildingResetAcknowledged = false;
 	xSemaphoreGive(pendingMutex);
 	return acknowledged;
+}
+
+void persistPendingBuildingQueue() {
+	if (pendingMutex == nullptr || xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) return;
+	persistPendingBuildingQueueLocked();
+	xSemaphoreGive(pendingMutex);
 }

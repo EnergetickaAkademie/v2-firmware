@@ -3,6 +3,12 @@
 
 #include <Arduino.h>
 
+// The release workflow generates this header from the public CA certificate
+// used by the API/MQTT endpoint. Local development builds may omit it.
+#if __has_include("GeneratedApiCaCert.h")
+#include "GeneratedApiCaCert.h"
+#endif
+
 #ifndef WIFI_SSID
 	#define WIFI_SSID "YOUR_SSID"
 #endif
@@ -41,6 +47,12 @@
 
 #ifndef FIRMWARE_VERSION
 	#define FIRMWARE_VERSION "dev"
+#endif
+
+// The normal build prefers MQTT v3. A recovery build can disable it and use
+// the existing HTTP /board/sync/v2 transport exclusively.
+#ifndef ENAK_MQTT_V3_ENABLED
+	#define ENAK_MQTT_V3_ENABLED 1
 #endif
 
 #define OUT_LATCH_PIN 10

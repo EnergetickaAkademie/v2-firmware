@@ -29,6 +29,7 @@ void statusLedUpdate();
 
 void statusLedSetWifiConnected(bool connected);
 void statusLedSetBoardRegistered(bool registered);
+void statusLedSetMqttHealthy(bool healthy);
 void statusLedRecordApiSuccess();
 void statusLedRecordApiFailure(StatusApiError error);
 void statusLedSetSubstationCount(uint8_t count);
