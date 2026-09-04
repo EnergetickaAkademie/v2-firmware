@@ -36,6 +36,7 @@ constexpr uint32_t BUILDING_RESET_RETRY_MS = 2000;
 bool boardRegistered = false;
 bool syncV2Available = true;
 bool firmwareModeActive = false;
+volatile bool debugNetworkMode = false;
 uint32_t syncV2RetryAt = 0;
 uint32_t syncSequence = 0;
 uint32_t lastConfigRevision = 0;
@@ -469,6 +470,22 @@ void connectWiFi() {
     beginWifiConnection(activeWifiSsid, activeWifiPassword, activeWifiSecurity);
 }
 
+void enterDebugNetworkMode() {
+    debugNetworkMode = true;
+    jwtToken = "";
+    boardRegistered = false;
+    statusLedSetBoardRegistered(false);
+    statusLedSetWifiConnected(false);
+    statusLedSetMqttHealthy(false);
+    mqttTransportStop();
+    mqttBootstrapAttempted = false;
+    WiFi.disconnect(false, false);
+}
+
+void leaveDebugNetworkMode() { debugNetworkMode = false; }
+
+bool isDebugNetworkMode() { return debugNetworkMode; }
+
 void initNetworkConfig() {
     wifiConfigMutex = xSemaphoreCreateMutex();
     if (wifiConfigMutex == nullptr) {
@@ -533,6 +550,18 @@ bool queueWifiProvisioning(const String& ssid, const String& password, uint8_t s
     xSemaphoreGive(wifiConfigMutex);
 
     Serial.printf("[WiFi] NFC provisioning queued for SSID: %s\n", ssid.c_str());
+    return true;
+}
+
+bool getActiveWifiConfig(ActiveWifiConfig& config) {
+    if (!wifiPreferencesReady || wifiConfigMutex == nullptr ||
+        xSemaphoreTake(wifiConfigMutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    config.ssid = activeWifiSsid;
+    config.security = activeWifiSecurity;
+    config.passwordSet = activeWifiPassword.length() > 0;
+    xSemaphoreGive(wifiConfigMutex);
     return true;
 }
 
@@ -1023,6 +1052,11 @@ void networkTaskImpl(void *pvParameters) {
         const bool otaActive = isOtaInProgress();
         setOtaNetworkTaskPaused(otaActive);
         if (otaActive) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (debugNetworkMode) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }

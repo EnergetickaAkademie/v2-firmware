@@ -494,6 +494,8 @@ class PowerplantManager(QWidget):
 		self.ota_password_input = QLineEdit()
 		self.ota_password_input.setEchoMode(QLineEdit.Password)
 		self.ota_hostname_input = QLineEdit("enak-mainboard")
+		self.debug_ap_password_input = QLineEdit("enak-debug")
+		self.debug_ap_password_input.setEchoMode(QLineEdit.Password)
 		self.api_ca_cert_file_input = QLineEdit()
 		self.firmware_version_input = QLineEdit("0.1.0")
 		self.firmware_channel_input = QLineEdit("stable")
@@ -519,6 +521,7 @@ class PowerplantManager(QWidget):
 		self.mainboard_form_layout.addRow("OTA port", self.ota_port_input)
 		self.mainboard_form_layout.addRow("OTA password", self.ota_password_input)
 		self.mainboard_form_layout.addRow("OTA hostname", self.ota_hostname_input)
+		self.mainboard_form_layout.addRow("Debug AP password", self.debug_ap_password_input)
 		self.mainboard_form_layout.addRow("API CA certificate file", self.api_ca_cert_file_input)
 		self.mainboard_form_layout.addRow("Firmware version", self.firmware_version_input)
 		self.mainboard_form_layout.addRow("Firmware channel", self.firmware_channel_input)
@@ -588,6 +591,7 @@ class PowerplantManager(QWidget):
 		self.wifi_password_input.setEchoMode(mode)
 		self.board_password_input.setEchoMode(mode)
 		self.ota_password_input.setEchoMode(mode)
+		self.debug_ap_password_input.setEchoMode(mode)
 
 	def update_upload_method_ui(self):
 		is_mainboard = self.board_combo.currentText() == "Mainboard"
@@ -707,6 +711,7 @@ class PowerplantManager(QWidget):
 			"ota_port": section.get("ota_port", "8080").strip(),
 			"ota_password": section.get("ota_password", "").strip(),
 			"ota_hostname": section.get("ota_hostname", "enak-mainboard").strip(),
+			"debug_ap_password": section.get("debug_ap_password", "enak-debug").strip(),
 			"api_ca_cert_file": section.get("api_ca_cert_file", "").strip(),
 			"firmware_version": section.get("firmware_version", "0.1.0").strip(),
 			"firmware_channel": section.get("firmware_channel", "").strip(),
@@ -733,6 +738,7 @@ class PowerplantManager(QWidget):
 		self.ota_port_input.setText(cfg["ota_port"])
 		self.ota_password_input.setText(cfg["ota_password"])
 		self.ota_hostname_input.setText(cfg["ota_hostname"])
+		self.debug_ap_password_input.setText(cfg["debug_ap_password"])
 		self.api_ca_cert_file_input.setText(cfg["api_ca_cert_file"])
 		self.firmware_version_input.setText(cfg["firmware_version"])
 		self.firmware_channel_input.setText(cfg["firmware_channel"])
@@ -754,6 +760,7 @@ class PowerplantManager(QWidget):
 			"ota_port": self.ota_port_input.text().strip(),
 			"ota_password": self.ota_password_input.text().strip(),
 			"ota_hostname": self.ota_hostname_input.text().strip(),
+			"debug_ap_password": self.debug_ap_password_input.text().strip(),
 			"api_ca_cert_file": self.api_ca_cert_file_input.text().strip(),
 			"firmware_version": self.firmware_version_input.text().strip(),
 			"firmware_channel": self.firmware_channel_input.text().strip(),
@@ -774,6 +781,8 @@ class PowerplantManager(QWidget):
 			raise ValueError(f"Missing values: {', '.join(missing)}")
 		if cfg["ota_password"] and len(cfg["ota_password"]) < 8:
 			raise ValueError("OTA password must contain at least 8 characters")
+		if len(cfg["debug_ap_password"]) < 8 or len(cfg["debug_ap_password"]) > 63:
+			raise ValueError("Debug AP password must contain 8–63 characters")
 		try:
 			cfg["ota_port"] = str(int(cfg["ota_port"] or "8080"))
 		except ValueError as exc:
@@ -892,6 +901,7 @@ class PowerplantManager(QWidget):
 			f'-DBOARD_PASSWORD=\\"{self._escape_define_value(cfg["board_password"])}\\"',
 			f'-DOTA_PASSWORD=\\"{self._escape_define_value(cfg["ota_password"] or "CHANGE_ME")}\\"',
 			f'-DOTA_HOSTNAME=\\"{self._escape_define_value(cfg["ota_hostname"])}\\"',
+			f'-DDEBUG_AP_PASSWORD=\\"{self._escape_define_value(cfg["debug_ap_password"])}\\"',
 			f'-DOTA_PORT={cfg["ota_port"] or "8080"}',
 			f'-DENAK_MQTT_V3_ENABLED={1 if cfg["mqtt_v3_enabled"] else 0}',
 			'-include src/GeneratedApiCaCert.h',

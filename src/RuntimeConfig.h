@@ -15,4 +15,8 @@ const String& runtimeOtaPassword();
 const String& runtimeOtaHostname();
 uint16_t runtimeOtaPort();
 
+bool saveRuntimeConfig(const String& apiUrl, const String& boardUsername,
+	const String& boardPassword, const String& otaPassword,
+	const String& otaHostname, uint16_t otaPort);
+
 #endif

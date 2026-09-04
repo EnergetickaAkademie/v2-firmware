@@ -29,9 +29,11 @@ constexpr Color YELLOW = {255, 180, 0};
 constexpr Color LIGHT_GREEN = {80, 255, 100};
 constexpr Color MEDIUM_GREEN = {20, 190, 60};
 constexpr Color DARK_GREEN = {0, 100, 25};
+constexpr Color TEAL = {0, 255, 160};
 
 struct SharedStatus {
     bool wifiConnected = false;
+    bool debugMode = false;
     bool wifiEverConnected = false;
     bool boardRegistered = false;
     bool mqttHealthy = false;
@@ -124,6 +126,11 @@ void statusLedUpdate() {
 
     if (status.otaState == StatusOtaState::Uploading) {
         render(breathing(CYAN, now, 500, 40));
+        return;
+    }
+
+    if (status.debugMode) {
+        render(breathing(TEAL, now, 900, 35));
         return;
     }
 
@@ -282,5 +289,11 @@ void statusLedSetOtaState(StatusOtaState state) {
     portENTER_CRITICAL(&statusMux);
     sharedStatus.otaState = state;
     sharedStatus.otaStateSinceMs = now;
+    portEXIT_CRITICAL(&statusMux);
+}
+
+void statusLedSetDebugMode(bool active) {
+    portENTER_CRITICAL(&statusMux);
+    sharedStatus.debugMode = active;
     portEXIT_CRITICAL(&statusMux);
 }

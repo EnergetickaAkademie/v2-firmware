@@ -18,7 +18,7 @@
 #define Serial DebugLog
 
 namespace {
-WebServer otaServer(OTA_PORT);
+WebServer* otaServer = nullptr;
 
 constexpr char OTA_PATH[] = "/ota/firmware";
 constexpr char STATUS_PATH[] = "/ota/status";
@@ -74,12 +74,12 @@ bool isAuthorized() {
     if (!runtimeConfigReady() || runtimeOtaPassword().length() < 8) {
         return false;
     }
-    return otaServer.header(AUTH_HEADER) == runtimeOtaPassword();
+    return otaServer != nullptr && otaServer->header(AUTH_HEADER) == runtimeOtaPassword();
 }
 
 void sendJson(int status, const String& body) {
-    otaServer.sendHeader("Cache-Control", "no-store");
-    otaServer.send(status, "application/json", body);
+    otaServer->sendHeader("Cache-Control", "no-store");
+    otaServer->send(status, "application/json", body);
 }
 
 void handleStatus() {
@@ -116,8 +116,8 @@ void handleLog() {
     }
 
     uint32_t since = 0;
-    if (otaServer.hasArg("since")) {
-        since = static_cast<uint32_t>(strtoul(otaServer.arg("since").c_str(), nullptr, 10));
+    if (otaServer->hasArg("since")) {
+        since = static_cast<uint32_t>(strtoul(otaServer->arg("since").c_str(), nullptr, 10));
     }
 
     String body;
@@ -127,17 +127,17 @@ void handleLog() {
     const uint32_t chunkStart =
         nextCursor - static_cast<uint32_t>(body.length());
 
-    otaServer.sendHeader("Cache-Control", "no-store");
-    otaServer.sendHeader("X-Log-Cursor", String(nextCursor));
-    otaServer.sendHeader("X-Log-Start", String(chunkStart));
-    otaServer.sendHeader("X-Log-Dropped", dropped ? "1" : "0");
-    otaServer.sendHeader("X-Log-Empty", hasData ? "0" : "1");
+    otaServer->sendHeader("Cache-Control", "no-store");
+    otaServer->sendHeader("X-Log-Cursor", String(nextCursor));
+    otaServer->sendHeader("X-Log-Start", String(chunkStart));
+    otaServer->sendHeader("X-Log-Dropped", dropped ? "1" : "0");
+    otaServer->sendHeader("X-Log-Empty", hasData ? "0" : "1");
 
     // WebServer::send() logs a warning for a zero-length body. Because core
     // logs are mirrored into this same buffer, an empty polling response used
     // to create a self-sustaining warning loop. Send an ignored placeholder.
     if (!hasData) body = " ";
-    otaServer.send(200, "text/plain; charset=utf-8", body);
+    otaServer->send(200, "text/plain; charset=utf-8", body);
 }
 
 void handleUploadFinished() {
@@ -163,7 +163,7 @@ void handleUploadFinished() {
 }
 
 void handleUploadChunk() {
-    HTTPUpload& upload = otaServer.upload();
+    HTTPUpload& upload = otaServer->upload();
 
     if (upload.status == UPLOAD_FILE_START) {
         if (updateInProgress || pullUpdateInProgress) {
@@ -248,16 +248,23 @@ void handleUploadChunk() {
 }
 
 void startServer() {
+    if (otaServer == nullptr) {
+        otaServer = new WebServer(runtimeOtaPort());
+        if (otaServer == nullptr) {
+            Serial.println("[OTA] Could not allocate OTA server.");
+            return;
+        }
+    }
     static const char* headers[] = {AUTH_HEADER};
-    otaServer.collectHeaders(headers, 1);
+    otaServer->collectHeaders(headers, 1);
 
-    otaServer.on(STATUS_PATH, HTTP_GET, handleStatus);
-    otaServer.on(LOG_PATH, HTTP_GET, handleLog);
-    otaServer.on(OTA_PATH, HTTP_POST, handleUploadFinished, handleUploadChunk);
-    otaServer.onNotFound([]() {
+    otaServer->on(STATUS_PATH, HTTP_GET, handleStatus);
+    otaServer->on(LOG_PATH, HTTP_GET, handleLog);
+    otaServer->on(OTA_PATH, HTTP_POST, handleUploadFinished, handleUploadChunk);
+    otaServer->onNotFound([]() {
         sendJson(404, "{\"error\":\"not_found\"}");
     });
-    otaServer.begin();
+    otaServer->begin();
 
     if (!MDNS.begin(runtimeOtaHostname().c_str())) {
         Serial.println("[OTA] mDNS setup failed; use the board IP address.");
@@ -310,7 +317,7 @@ void handleOta() {
     if (!serverStarted && WiFi.status() == WL_CONNECTED) startServer();
     if (!serverStarted) return;
 
-    otaServer.handleClient();
+    if (otaServer != nullptr) otaServer->handleClient();
 
     if (restartPending && millis() - restartRequestedAt >= 750) {
         Serial.println("[OTA] Rebooting into updated firmware.");

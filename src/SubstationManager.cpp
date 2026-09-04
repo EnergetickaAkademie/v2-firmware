@@ -268,3 +268,14 @@ void updateTotalCounts() {
 uint8_t getOnlineSubstationCount() {
     return onlineSubstationCount;
 }
+
+void getSubstationSnapshots(SubstationSnapshot snapshots[3]) {
+    if (snapshots == nullptr) return;
+    const uint32_t now = millis();
+    for (size_t i = 0; i < 3; ++i) {
+        snapshots[i].online = subs[i].online;
+        snapshots[i].lastSeenAgeMs = subs[i].lastAlive == 0
+            ? UINT32_MAX : now - subs[i].lastAlive;
+        memcpy(snapshots[i].counts, subs[i].counts, sizeof(snapshots[i].counts));
+    }
+}

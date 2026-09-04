@@ -18,6 +18,7 @@ ota_host = 192.168.1.50
 ota_port = 8080
 ota_password = replace-with-a-long-random-password
 ota_hostname = enak-mainboard-1
+debug_ap_password = enak-debug
 # PEM root CA certificate trusted by the board for HTTPS API downloads.
 # Required when server_endpoint uses https://.
 api_ca_cert_file =

@@ -10,6 +10,8 @@ int32_t currentTotalConsumption_MW = 0;
 
 int32_t encoderValuesMW[6] = {0};
 float encoderPercentages[6] = {0.0f};
+int32_t debugDisplayValues[8] = {0};
+bool debugDisplayVisible[8] = {false};
 
 int32_t baseMinMW[9] = {0};
 int32_t baseMaxMW[9] = {0}; 

@@ -12,6 +12,8 @@ extern int32_t currentTotalConsumption_MW;
 
 extern int32_t encoderValuesMW[6];
 extern float encoderPercentages[6];
+extern int32_t debugDisplayValues[8];
+extern bool debugDisplayVisible[8];
 
 extern int32_t baseMinMW[9];
 extern int32_t baseMaxMW[9];

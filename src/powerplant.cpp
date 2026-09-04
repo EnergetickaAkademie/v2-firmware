@@ -15,10 +15,19 @@ constexpr uint32_t SOLAR_ADC_PIN = PA1;
 // full-power kick for reliable starting, then run at a fixed reduced duty to
 // limit continuous current and voltage drop in the power distribution path.
 constexpr uint8_t MOTOR_FULL_DUTY = 255;
-constexpr uint8_t WIND_MOTOR_RUN_DUTY = 100;
+constexpr uint8_t WIND_MOTOR_RUN_DUTY = 200;
 constexpr uint32_t WIND_MOTOR_KICK_MS = 300;
+
 constexpr uint8_t NEBULIZER_DUTY = 255;
+
+// After an explicit OFF command, prevent the nebulizer from being restarted
+// immediately. The physical nebulizer button/electronics need some time
+// before another activation can be accepted.
 constexpr uint32_t NEBULIZER_COOLDOWN_MS = 5000;
+
+// Communication watchdog for continuously controlled motors only.
+// Nebulizers deliberately do NOT use this timeout: once switched on,
+// they remain on until an explicit CMD_MOTOR_OFF is received.
 constexpr uint32_t ACTUATOR_COMMAND_TIMEOUT_MS = 2500;
 
 constexpr uint32_t SOLAR_SAMPLE_INTERVAL_MS = 25;
@@ -79,11 +88,12 @@ bool hasActuator() {
 
 void setDriverDuty(uint8_t duty) {
 	if (driver_duty == duty) return;
+
 	driver_duty = duty;
 
-	// Keep the motor pin under timer control on the CH32 Arduino core. Duty 0
-	// and 255 produce constant output levels; intermediate wind-motor values
-	// use PWM at the frequency configured in setup().
+	// Keep the motor pin under timer control on the CH32 Arduino core.
+	// Duty 0 and 255 produce constant output levels; intermediate
+	// wind-motor values use PWM at the frequency configured in setup().
 	analogWrite(MOTOR_PIN_A, duty);
 	analogWrite(MOTOR_PIN_B, 0);
 }
@@ -111,7 +121,10 @@ void updateVariableMotor(uint32_t now) {
 
 	if (DEVICE_TYPE == TYPE_WIND) {
 		if (wind_motor_kicking) {
-			if (now - wind_motor_kick_started_ms < WIND_MOTOR_KICK_MS) return;
+			if (now - wind_motor_kick_started_ms < WIND_MOTOR_KICK_MS) {
+				return;
+			}
+
 			wind_motor_kicking = false;
 		}
 
@@ -119,24 +132,40 @@ void updateVariableMotor(uint32_t now) {
 		return;
 	}
 
+	// Hydro runs continuously at full duty while requested.
 	setDriverDuty(MOTOR_FULL_DUTY);
 }
 
 void updateNebulizer(uint32_t now) {
+	// An explicit OFF command sets requested_actuator_percent to zero.
 	if (requested_actuator_percent == 0) {
 		if (nebulizer_running) {
 			nebulizer_running = false;
+
+			// Begin cooldown only after the nebulizer was actually running
+			// and has now been deliberately switched off.
 			nebulizer_cooling_down = true;
 			nebulizer_stopped_ms = now;
+
 			setDriverDuty(0);
 		}
+
 		return;
 	}
 
-	if (nebulizer_running) return;
+	// Once running, keep the nebulizer powered continuously.
+	// It does not depend on periodic command refreshes.
+	if (nebulizer_running) {
+		return;
+	}
 
+	// If it was recently switched off, wait for the physical nebulizer
+	// electronics/button circuit to become ready for another activation.
 	if (nebulizer_cooling_down) {
-		if (now - nebulizer_stopped_ms < NEBULIZER_COOLDOWN_MS) return;
+		if (now - nebulizer_stopped_ms < NEBULIZER_COOLDOWN_MS) {
+			return;
+		}
+
 		nebulizer_cooling_down = false;
 	}
 
@@ -150,86 +179,148 @@ void updateActuator(uint32_t now) {
 		return;
 	}
 
-	if (actuator_command_received &&
-		now - last_actuator_command_ms >= ACTUATOR_COMMAND_TIMEOUT_MS) {
-		actuator_command_received = false;
+	/*
+	 * Wind and hydro motors are continuously controlled devices. If their
+	 * commands stop arriving, fail safe and switch them off after the
+	 * actuator watchdog timeout.
+	 *
+	 * Coal and nuclear nebulizers are different. Their state is latched:
+	 *
+	 *     CMD_MOTOR_ON  -> remain ON
+	 *     CMD_MOTOR_OFF -> switch OFF
+	 *
+	 * A temporary BitBus/communication interruption therefore must NOT
+	 * switch a nebulizer off, because doing so would trigger its cooldown
+	 * and cause visible ON/OFF cycling.
+	 */
+	if (isVariableMotorType()) {
+		if (actuator_command_received &&
+			now - last_actuator_command_ms >= ACTUATOR_COMMAND_TIMEOUT_MS) {
+
+			actuator_command_received = false;
 		requested_actuator_percent = 0;
+			}
+
+			updateVariableMotor(now);
+			return;
 	}
 
-	if (isVariableMotorType()) updateVariableMotor(now);
-	else updateNebulizer(now);
+	// Nebulizers deliberately ignore ACTUATOR_COMMAND_TIMEOUT_MS.
+	// Their last commanded state remains active until another explicit
+	// motor command changes it.
+	updateNebulizer(now);
 }
 
 void updateSolarIndicator(uint32_t now) {
-	if (solar_rgb == nullptr) return;
+	if (solar_rgb == nullptr) {
+		return;
+	}
 
 	if (now - last_solar_sample_ms >= SOLAR_SAMPLE_INTERVAL_MS) {
 		last_solar_sample_ms = now;
-		const int32_t sample_x8 = static_cast<int32_t>(analogRead(SOLAR_ADC_PIN)) * 8;
+
+		const int32_t sample_x8 =
+		static_cast<int32_t>(analogRead(SOLAR_ADC_PIN)) * 8;
+
 		if (!solar_filter_initialized) {
 			filtered_solar_adc_x8 = sample_x8;
 			solar_filter_initialized = true;
 		} else {
-			filtered_solar_adc_x8 += (sample_x8 - filtered_solar_adc_x8) / 8;
+			filtered_solar_adc_x8 +=
+			(sample_x8 - filtered_solar_adc_x8) / 8;
 		}
 	}
 
-	if (!solar_filter_initialized || now - last_solar_led_ms < SOLAR_LED_INTERVAL_MS) return;
-	last_solar_led_ms = now;
+	if (!solar_filter_initialized ||
+		now - last_solar_led_ms < SOLAR_LED_INTERVAL_MS) {
+		return;
+		}
+
+		last_solar_led_ms = now;
 
 	const uint16_t filtered_adc = filtered_solar_adc_x8 / 8;
+
 	uint8_t level = 0;
+
 	if (filtered_adc >= SOLAR_BRIGHT_ADC) {
 		level = 255;
 	} else if (filtered_adc > SOLAR_DARK_ADC) {
-		level = static_cast<uint32_t>(filtered_adc - SOLAR_DARK_ADC) * 255 /
-			(SOLAR_BRIGHT_ADC - SOLAR_DARK_ADC);
+		level =
+		static_cast<uint32_t>(filtered_adc - SOLAR_DARK_ADC) * 255 /
+		(SOLAR_BRIGHT_ADC - SOLAR_DARK_ADC);
 	}
 
 	uint8_t r;
 	uint8_t g;
+
 	if (level <= 127) {
 		r = SOLAR_LED_BRIGHTNESS;
-		g = static_cast<uint16_t>(level) * SOLAR_LED_BRIGHTNESS / 127;
+		g = static_cast<uint16_t>(level) *
+		SOLAR_LED_BRIGHTNESS / 127;
 	} else {
-		r = static_cast<uint16_t>(255 - level) * SOLAR_LED_BRIGHTNESS / 128;
+		r = static_cast<uint16_t>(255 - level) *
+		SOLAR_LED_BRIGHTNESS / 128;
 		g = SOLAR_LED_BRIGHTNESS;
 	}
 
-	if (!solar_color_initialized || r != last_solar_r || g != last_solar_g) {
+	if (!solar_color_initialized ||
+		r != last_solar_r ||
+		g != last_solar_g) {
+
 		solar_rgb->setColor(r, g, 0);
-		last_solar_r = r;
-		last_solar_g = g;
-		solar_color_initialized = true;
-	}
+
+	last_solar_r = r;
+	last_solar_g = g;
+	solar_color_initialized = true;
+		}
 }
 
-void handleCommand(uint8_t cmd, const uint8_t* payload, uint8_t len) {
+void handleCommand(
+	uint8_t cmd,
+	const uint8_t* payload,
+	uint8_t len
+) {
 	switch (cmd) {
 		case CMD_LED_BLINK:
 			digitalWrite(POWERPLANT_STATUS_LED_PIN, HIGH);
+
 			status_led_turn_off_ms = millis() + 100;
 			status_led_active = true;
 			break;
 
 		case CMD_RGB:
-			if (len == 3 && payload != nullptr && status_rgb != nullptr) {
-				status_rgb->setColor(payload[0], payload[1], payload[2]);
-			}
-			break;
+			if (len == 3 &&
+				payload != nullptr &&
+				status_rgb != nullptr) {
+
+				status_rgb->setColor(
+					payload[0],
+					payload[1],
+					payload[2]
+				);
+				}
+				break;
 
 		case CMD_MOTOR_ON:
-			if (!hasActuator() || len != 1 || payload == nullptr ||
-				payload[0] == 0 || payload[0] > 100) {
+			if (!hasActuator() ||
+				len != 1 ||
+				payload == nullptr ||
+				payload[0] == 0 ||
+				payload[0] > 100) {
+
 				break;
-			}
-			requested_actuator_percent = payload[0];
+				}
+
+				requested_actuator_percent = payload[0];
 			last_actuator_command_ms = millis();
 			actuator_command_received = true;
 			break;
 
 		case CMD_MOTOR_OFF:
-			if (!hasActuator() || len != 0) break;
+			if (!hasActuator() || len != 0) {
+				break;
+			}
+
 			requested_actuator_percent = 0;
 			last_actuator_command_ms = millis();
 			actuator_command_received = true;
@@ -242,19 +333,32 @@ void setup() {
 	digitalWrite(POWERPLANT_STATUS_LED_PIN, LOW);
 
 	analogWriteResolution(8);
-	analogWriteFrequency(50);
+	analogWriteFrequency(250);
+
 	pinMode(MOTOR_PIN_A, OUTPUT);
 	pinMode(MOTOR_PIN_B, OUTPUT);
+
 	analogWrite(MOTOR_PIN_A, 0);
 	analogWrite(MOTOR_PIN_B, 0);
 
 	status_rgb = factory.createSimpleRGB(STATUS_RGB_PIN);
-	if (status_rgb != nullptr) status_rgb->setColor(5, 0, 5);
+
+	if (status_rgb != nullptr) {
+		status_rgb->setColor(5, 0, 5);
+	}
 
 	if (DEVICE_TYPE == TYPE_SOLAR) {
 		pinMode(SOLAR_ADC_PIN, INPUT_ANALOG);
+
 		solar_rgb = factory.createSimpleRGB(SOLAR_RGB_PIN);
-		if (solar_rgb != nullptr) solar_rgb->setColor(SOLAR_LED_BRIGHTNESS, 0, 0);
+
+		if (solar_rgb != nullptr) {
+			solar_rgb->setColor(
+				SOLAR_LED_BRIGHTNESS,
+				0,
+				0
+			);
+		}
 	}
 
 	powerplant.begin();
@@ -265,12 +369,15 @@ void loop() {
 	powerplant.listen();
 
 	const uint32_t now = millis();
+
 	updateActuator(now);
 	updateSolarIndicator(now);
 	factory.update();
 
-	if (status_led_active && static_cast<int32_t>(now - status_led_turn_off_ms) >= 0) {
+	if (status_led_active &&
+		static_cast<int32_t>(now - status_led_turn_off_ms) >= 0) {
+
 		digitalWrite(POWERPLANT_STATUS_LED_PIN, LOW);
-		status_led_active = false;
-	}
+	status_led_active = false;
+		}
 }

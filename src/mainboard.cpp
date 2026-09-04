@@ -4,9 +4,12 @@
 #include "RuntimeConfig.h"
 #include "GameState.h"
 #include "NetworkManager.h"
+#include "NfcDebug.h"
+#include "MainboardDebug.h"
 #include "OtaManager.h"
 #include "StatusLedManager.h"
 #include "SubstationManager.h"
+#include "DebugPortal.h"
 #include "PeripheralFactory.h"
 #include "BuildingTypes.h"
 #include <algorithm>
@@ -110,8 +113,10 @@ namespace {
 constexpr size_t NTAG213_USER_BYTES = 144;
 constexpr size_t INITIAL_NDEF_READ_BYTES = 32;
 constexpr uint32_t RESET_HOLD_MS = 2000;
+constexpr uint32_t DEBUG_HOLD_MS = 3000;
 constexpr uint8_t NFC_PROTOCOL_VERSION = 2;
 constexpr uint8_t ADMIN_COMMAND_RESET_BUILDINGS = 1;
+constexpr uint8_t ADMIN_COMMAND_ENTER_DEBUG = 2;
 constexpr uint8_t NDEF_TNF_EXTERNAL_TYPE = 0x04;
 
 struct NdefRecordView {
@@ -253,6 +258,203 @@ bool readUltralightNdef(uint8_t* data, size_t& dataLength) {
 	return true;
 }
 
+bool readMifareNdef(uint8_t* uid, uint8_t uidLength, uint8_t* data, size_t& dataLength) {
+	uint8_t keyNdef[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+	uint8_t keyUniversal[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+	if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNdef) &&
+		!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
+		return false;
+	}
+	memset(data, 0, NTAG213_USER_BYTES);
+	size_t dataOffset = 0;
+	for (uint8_t block = 4; block < 16; ++block) {
+		if (nfc.mifareclassic_IsTrailerBlock(block)) continue;
+		if (dataOffset + 16 > NTAG213_USER_BYTES) break;
+		if (!nfc.mifareclassic_ReadDataBlock(block, data + dataOffset)) return false;
+		dataOffset += 16;
+	}
+	dataLength = dataOffset;
+	size_t messageOffset = 0;
+	size_t messageLength = 0;
+	if (!findNdefMessage(data, dataLength, messageOffset, messageLength)) return true;
+	if (messageOffset + messageLength > dataLength) return false;
+	dataLength = messageOffset + messageLength;
+	return true;
+}
+
+bool buildDebugNdef(const NfcDebugProfile& profile, uint8_t* output,
+					size_t capacity, size_t& length, String& recordType) {
+	uint8_t payload[128] = {};
+	size_t payloadLength = 0;
+	if (profile.kind == NfcDebugProfileKind::Building) {
+		payload[0] = NFC_PROTOCOL_VERSION;
+		payload[1] = profile.buildingType;
+		payloadLength = 2;
+		recordType = "cz.enak:building";
+	} else if (profile.kind == NfcDebugProfileKind::Reset ||
+			   profile.kind == NfcDebugProfileKind::Debug) {
+		payload[0] = NFC_PROTOCOL_VERSION;
+		payload[1] = profile.kind == NfcDebugProfileKind::Reset ? 1 : 2;
+		payloadLength = 2;
+		recordType = "cz.enak:cmd";
+	} else if (profile.kind == NfcDebugProfileKind::Wifi) {
+		const size_t ssidLength = profile.wifiSsid.length();
+		const size_t passwordLength = profile.wifiPassword.length();
+		if (ssidLength == 0 || ssidLength > 32 || profile.wifiSecurity > 1 ||
+			passwordLength > 63 ||
+			(profile.wifiSecurity == 1 && passwordLength < 8) ||
+			(profile.wifiSecurity == 0 && passwordLength != 0)) return false;
+		payload[0] = NFC_PROTOCOL_VERSION;
+		payload[1] = profile.wifiSecurity;
+		payload[2] = ssidLength;
+		memcpy(payload + 3, profile.wifiSsid.c_str(), ssidLength);
+		size_t offset = 3 + ssidLength;
+		payload[offset++] = passwordLength;
+		memcpy(payload + offset, profile.wifiPassword.c_str(), passwordLength);
+		offset += passwordLength;
+		const uint32_t checksum = crc32(payload, offset);
+		payload[offset++] = checksum >> 24;
+		payload[offset++] = checksum >> 16;
+		payload[offset++] = checksum >> 8;
+		payload[offset++] = checksum;
+		payloadLength = offset;
+		recordType = "cz.enak:wifi";
+	} else {
+		return false;
+	}
+
+	const size_t typeLength = recordType.length();
+	const size_t messageLength = 3 + typeLength + payloadLength;
+	const size_t totalLength = 2 + messageLength + 1;
+	if (typeLength > 255 || payloadLength > 255 || messageLength > 254 || totalLength > capacity) return false;
+	output[0] = 0x03;
+	output[1] = static_cast<uint8_t>(messageLength);
+	output[2] = 0xD4; // MB + ME + short record + external type
+	output[3] = static_cast<uint8_t>(typeLength);
+	output[4] = static_cast<uint8_t>(payloadLength);
+	memcpy(output + 5, recordType.c_str(), typeLength);
+	memcpy(output + 5 + typeLength, payload, payloadLength);
+	output[2 + messageLength] = 0xFE;
+	length = totalLength;
+	return true;
+}
+
+bool writeUltralightNdef(const uint8_t* message, size_t length) {
+	if (length == 0 || length > NTAG213_USER_BYTES) return false;
+	const size_t pages = (length + 3) / 4;
+	for (size_t pageIndex = 0; pageIndex < pages; ++pageIndex) {
+		uint8_t page[4] = {0, 0, 0, 0};
+		const size_t offset = pageIndex * 4;
+		memcpy(page, message + offset, min<size_t>(4, length - offset));
+		if (!nfc.mifareultralight_WritePage(static_cast<uint8_t>(4 + pageIndex), page)) return false;
+	}
+	return true;
+}
+
+bool writeMifareNdef(uint8_t* uid, uint8_t uidLength, const uint8_t* message, size_t length) {
+	if (length == 0 || length > 720) return false;
+	uint8_t keyNdef[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
+	uint8_t keyUniversal[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+	uint8_t blockBuffer[16];
+	size_t offset = 0;
+	for (uint8_t block = 4; offset < length && block < 64; ++block) {
+		if (nfc.mifareclassic_IsTrailerBlock(block)) continue;
+		if ((block - 4) % 4 == 0 &&
+			!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, block, 0, keyNdef) &&
+			!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, block, 0, keyUniversal)) return false;
+		memset(blockBuffer, 0, sizeof(blockBuffer));
+		const size_t count = min<size_t>(16, length - offset);
+		memcpy(blockBuffer, message + offset, count);
+		if (!nfc.mifareclassic_WriteDataBlock(block, blockBuffer)) return false;
+		offset += count;
+	}
+	return offset == length;
+}
+
+bool ndefPayloadMatches(const uint8_t* data, size_t dataLength,
+						const uint8_t* message, size_t messageLength) {
+	size_t messageOffset = 0;
+	size_t foundLength = 0;
+	if (!findNdefMessage(data, dataLength, messageOffset, foundLength) ||
+		foundLength != messageLength || messageOffset + foundLength > dataLength) return false;
+	return memcmp(data + messageOffset, message + 2, messageLength) == 0;
+}
+
+void processDebugNfcTag(uint8_t* uid, uint8_t uidLength, const String& uidStr,
+						NfcDebugMode mode) {
+	NfcDebugEvent event;
+	event.uid = uidStr;
+	event.technology = uidLength == 7 ? "NTAG/Ultralight" :
+		(uidLength == 4 ? "MIFARE Classic" : "ISO14443A");
+	event.recordType = "Unknown";
+	event.protocol = "unknown";
+	event.detail = "Tag memory read failed";
+	event.write = mode == NfcDebugMode::Write;
+
+	uint8_t data[NTAG213_USER_BYTES] = {};
+	size_t dataLength = 0;
+	bool readSuccess = false;
+	if (uidLength == 7) readSuccess = readUltralightNdef(data, dataLength);
+	else if (uidLength == 4) readSuccess = readMifareNdef(uid, uidLength, data, dataLength);
+
+	NdefRecordView record;
+	const bool ndefFound = readSuccess && parseFirstNdefRecord(data, dataLength, record);
+	if (ndefFound) {
+		event.recordType = String(reinterpret_cast<const char*>(record.type), record.typeLength);
+		event.protocol = record.payloadLength > 0 && record.payload[0] == NFC_PROTOCOL_VERSION ? "v2" : "unknown";
+		if (event.recordType == "cz.enak:building" && record.payloadLength == 2 && record.payload[0] == NFC_PROTOCOL_VERSION) {
+			event.buildingType = record.payload[1];
+			event.detail = String("Building type 0x") + String(event.buildingType, HEX);
+			event.success = event.buildingType < BUILDING_COUNT;
+		} else if (event.recordType == "cz.enak:cmd" && record.payloadLength == 2 && record.payload[0] == NFC_PROTOCOL_VERSION) {
+			event.detail = record.payload[1] == 1 ? "Building reset command" :
+				(record.payload[1] == 2 ? "Debug command" : "Unknown command");
+			event.success = record.payload[1] == 1 || record.payload[1] == 2;
+		} else if (event.recordType == "cz.enak:wifi") {
+			event.detail = "Wi-Fi provisioning record";
+			event.success = record.payloadLength >= 9 && record.payload[0] == NFC_PROTOCOL_VERSION;
+		} else {
+			event.detail = "Unsupported or malformed ENAK record";
+		}
+	} else if (readSuccess) {
+		event.detail = "No readable NDEF record";
+		event.success = false;
+	}
+
+	if (mode == NfcDebugMode::Write) {
+		const NfcDebugProfile profile = nfcDebugProfile();
+		uint8_t message[NTAG213_USER_BYTES] = {};
+		size_t messageLength = 0;
+		String type;
+		const bool built = buildDebugNdef(profile, message, sizeof(message), messageLength, type);
+		bool written = false;
+		if (built) {
+			if (uidLength == 7) written = writeUltralightNdef(message, messageLength);
+			else if (uidLength == 4) written = writeMifareNdef(uid, uidLength, message, messageLength);
+		}
+		event.recordType = type.length() > 0 ? type : event.recordType;
+		event.detail = !built ? "Invalid write profile or tag capacity" :
+			(!written ? "NDEF write failed or tag unsupported" : "NDEF written and verified");
+		event.success = false;
+		if (written) {
+			uint8_t verify[NTAG213_USER_BYTES] = {};
+			size_t verifyLength = 0;
+			const bool verifiedRead = uidLength == 7 ? readUltralightNdef(verify, verifyLength) :
+				readMifareNdef(uid, uidLength, verify, verifyLength);
+			event.success = verifiedRead && ndefPayloadMatches(verify, verifyLength, message, messageLength);
+			if (!event.success) event.detail = "NDEF write completed but verification failed";
+		}
+	}
+	nfcDebugRecordEvent(event);
+	if (event.success) {
+		statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+		tone(BUZZER_PIN, event.write ? 2200 : 1900, 120);
+	} else {
+		statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
+		tone(BUZZER_PIN, 350, 180);
+	}
+}
+
 bool parseWifiProvisioning(const NdefRecordView& record,
 						   String& ssid, String& password, uint8_t& security) {
 	if (record.payloadLength < 9 || record.payload[0] != NFC_PROTOCOL_VERSION) {
@@ -307,21 +509,31 @@ void updateDisplays() {
 	int32_t combinedBatteryPump = productionByTypeMW[8] + productionByTypeMW[6];
 	int32_t combinedWindSolar = productionByTypeMW[2] + productionByTypeMW[1];
 
-	if (currentCoefficient[7] > 0.0) coalDisplay.displayNumber(productionByTypeMW[7], 0);
-	else coalDisplay.clear();
-	if (currentCoefficient[5] > 0.0) hydroDisplay.displayNumber(productionByTypeMW[5], 0);
-	else hydroDisplay.clear();
-	if (currentCoefficient[8] > 0.0 || currentCoefficient[6] > 0.0) batteryDisplay.displayNumber(combinedBatteryPump, 0);
-	else batteryDisplay.clear();
-	if (currentCoefficient[3] > 0.0) nuclearDisplay.displayNumber(productionByTypeMW[3], 0);
-	else nuclearDisplay.clear();
-	if (currentCoefficient[4] > 0.0) gasDisplay.displayNumber(productionByTypeMW[4], 0);
-	else gasDisplay.clear();
-	if (currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0) windPvDisplay.displayNumber(combinedWindSolar, 0);
-	else windPvDisplay.clear();
+	debugDisplayValues[2] = productionByTypeMW[7];
+	debugDisplayVisible[2] = currentCoefficient[7] > 0.0;
+	if (debugDisplayVisible[2]) coalDisplay.displayNumber(debugDisplayValues[2], 0); else coalDisplay.clear();
+	debugDisplayValues[3] = productionByTypeMW[5];
+	debugDisplayVisible[3] = currentCoefficient[5] > 0.0;
+	if (debugDisplayVisible[3]) hydroDisplay.displayNumber(debugDisplayValues[3], 0); else hydroDisplay.clear();
+	debugDisplayValues[4] = combinedBatteryPump;
+	debugDisplayVisible[4] = currentCoefficient[8] > 0.0 || currentCoefficient[6] > 0.0;
+	if (debugDisplayVisible[4]) batteryDisplay.displayNumber(debugDisplayValues[4], 0); else batteryDisplay.clear();
+	debugDisplayValues[5] = productionByTypeMW[3];
+	debugDisplayVisible[5] = currentCoefficient[3] > 0.0;
+	if (debugDisplayVisible[5]) nuclearDisplay.displayNumber(debugDisplayValues[5], 0); else nuclearDisplay.clear();
+	debugDisplayValues[6] = productionByTypeMW[4];
+	debugDisplayVisible[6] = currentCoefficient[4] > 0.0;
+	if (debugDisplayVisible[6]) gasDisplay.displayNumber(debugDisplayValues[6], 0); else gasDisplay.clear();
+	debugDisplayValues[7] = combinedWindSolar;
+	debugDisplayVisible[7] = currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0;
+	if (debugDisplayVisible[7]) windPvDisplay.displayNumber(debugDisplayValues[7], 0); else windPvDisplay.clear();
 
-	if (consumptionDisp) consumptionDisp->displayNumber(currentTotalConsumption_MW, 0);
-	if (productionDisp) productionDisp->displayNumber(currentTotalProduction_MW, 0);
+	debugDisplayValues[0] = currentTotalConsumption_MW;
+	debugDisplayValues[1] = currentTotalProduction_MW;
+	debugDisplayVisible[0] = consumptionDisp != nullptr;
+	debugDisplayVisible[1] = productionDisp != nullptr;
+	if (consumptionDisp) consumptionDisp->displayNumber(debugDisplayValues[0], 0);
+	if (productionDisp) productionDisp->displayNumber(debugDisplayValues[1], 0);
 }
 
 bool updateBargraphs() {
@@ -414,11 +626,39 @@ bool updateBargraphs() {
 	return anyChanged;
 }
 
+bool getDebugEncoderRange(uint8_t index, int32_t& minimum, int32_t& maximum) {
+	if (index >= 5) return false;
+	const uint8_t type = apiTypeMap[index];
+	if (index == 2) {
+		minimum = static_cast<int32_t>(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) +
+			static_cast<int32_t>(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
+		maximum = static_cast<int32_t>(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) +
+			static_cast<int32_t>(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
+	} else {
+		minimum = static_cast<int32_t>(baseMinMW[type] * connectedCount[type] * currentCoefficient[type]);
+		maximum = static_cast<int32_t>(baseMaxMW[type] * connectedCount[type] * currentCoefficient[type]);
+	}
+	return true;
+}
+
+bool setDebugEncoderValue(uint8_t index, int32_t value) {
+	if (index >= 5 || index >= encoders.size() || encoders[index] == nullptr) return false;
+	int32_t minimum = 0;
+	int32_t maximum = 0;
+	if (!getDebugEncoderRange(index, minimum, maximum)) return false;
+	if (value < minimum || value > maximum) return false;
+	encoders[index]->set_value(value);
+	return true;
+}
+
 void nfcTaskImpl(void *pvParameters) {
 	String presentedUid;
 	String resetArmedUid;
 	uint32_t resetArmedAtMs = 0;
 	bool resetExecuted = false;
+	String debugArmedUid;
+	uint32_t debugArmedAtMs = 0;
+	bool debugExecuted = false;
 	uint8_t consecutiveNoTagPolls = 0;
 	uint32_t noTagPolls = 0;
 	uint32_t lastHealthLogMs = millis();
@@ -454,6 +694,23 @@ void nfcTaskImpl(void *pvParameters) {
 				uidStr += String(uid[i], HEX);
 			}
 
+			const NfcDebugMode debugMode = nfcDebugMode();
+			if (isDebugPortalActive() && debugMode != NfcDebugMode::Normal) {
+				if (uidStr == presentedUid) {
+					vTaskDelay(pdMS_TO_TICKS(100));
+					continue;
+				}
+				resetArmedUid = "";
+				resetArmedAtMs = 0;
+				resetExecuted = false;
+				debugArmedUid = "";
+				debugArmedAtMs = 0;
+				debugExecuted = false;
+				presentedUid = uidStr;
+				processDebugNfcTag(uid, uidLength, uidStr, debugMode);
+				continue;
+			}
+
 			if (uidStr == presentedUid) {
 				if (!resetExecuted && resetArmedUid == uidStr &&
 					millis() - resetArmedAtMs >= RESET_HOLD_MS) {
@@ -463,12 +720,25 @@ void nfcTaskImpl(void *pvParameters) {
 					Serial.println("[NFC] Reset card hold confirmed; building state cleared.");
 					playResetConfirmedTone();
 				}
+				if (!debugExecuted && debugArmedUid == uidStr &&
+					millis() - debugArmedAtMs >= DEBUG_HOLD_MS) {
+					requestDebugPortal();
+					debugExecuted = true;
+					statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+					Serial.println("[NFC] Debug card hold confirmed; starting local portal.");
+					tone(BUZZER_PIN, 1900, 120);
+					vTaskDelay(pdMS_TO_TICKS(140));
+					tone(BUZZER_PIN, 2600, 220);
+				}
 				vTaskDelay(pdMS_TO_TICKS(100));
 				continue;
 			}
 			resetArmedUid = "";
 			resetArmedAtMs = 0;
 			resetExecuted = false;
+			debugArmedUid = "";
+			debugArmedAtMs = 0;
+			debugExecuted = false;
 			presentedUid = uidStr;
 
 			uint8_t data[NTAG213_USER_BYTES] = {0};
@@ -478,21 +748,7 @@ void nfcTaskImpl(void *pvParameters) {
 			if (uidLength == 7) {
 				readSuccess = readUltralightNdef(data, dataLength);
 			} else if (uidLength == 4) {
-				uint8_t keyNDEF[6]      = { 0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7 };
-				uint8_t keyUniversal[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-
-				if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNDEF)) {
-					if (nfc.mifareclassic_ReadDataBlock(4, data)) {
-						readSuccess = true;
-						dataLength = 16;
-					}
-				}
-				else if (nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
-					if (nfc.mifareclassic_ReadDataBlock(4, data)) {
-						readSuccess = true;
-						dataLength = 16;
-					}
-				}
+				readSuccess = readMifareNdef(uid, uidLength, data, dataLength);
 			}
 
 			if (readSuccess) {
@@ -508,6 +764,14 @@ void nfcTaskImpl(void *pvParameters) {
 						resetExecuted = false;
 						Serial.println("[NFC] Reset card recognized; hold it in place for two seconds.");
 						tone(BUZZER_PIN, 800, 100);
+					} else if (record.payloadLength == 2 &&
+						record.payload[0] == NFC_PROTOCOL_VERSION &&
+						record.payload[1] == ADMIN_COMMAND_ENTER_DEBUG) {
+						debugArmedUid = uidStr;
+						debugArmedAtMs = millis();
+						debugExecuted = false;
+						Serial.println("[NFC] Debug card recognized; hold it in place for three seconds.");
+						tone(BUZZER_PIN, 1100, 100);
 					} else {
 						Serial.println("[NFC] Unsupported administrative command record.");
 						statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
@@ -605,10 +869,16 @@ void nfcTaskImpl(void *pvParameters) {
 					Serial.println("[NFC] Reset cancelled because the card was removed too soon.");
 					tone(BUZZER_PIN, 300, 160);
 				}
+				if (debugArmedUid.length() > 0 && !debugExecuted) {
+					Serial.println("[NFC] Debug card removed before the three-second hold.");
+				}
 				presentedUid = "";
 				resetArmedUid = "";
 				resetArmedAtMs = 0;
 				resetExecuted = false;
+				debugArmedUid = "";
+				debugArmedAtMs = 0;
+				debugExecuted = false;
 			}
 
 			if (now - lastHealthLogMs >= 30000) {
@@ -760,7 +1030,8 @@ void setup() {
 void loop() {
 	const uint32_t now = millis();
 	statusLedUpdate();
-	handleOta();
+	handleDebugPortal();
+	if (!isDebugPortalActive()) handleOta();
 	if (isOtaInProgress()) {
 		// Keep the loop focused on the OTA server and status LED. In particular,
 		// avoid substation I/O and display shifting while flash is being written.

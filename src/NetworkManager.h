@@ -12,5 +12,16 @@ bool sendAddBuilding(uint8_t type, const String& uid);
 void pollBuildingCounts();
 void applyMqttFirmwareMode(bool active);
 
+struct ActiveWifiConfig {
+    String ssid;
+    uint8_t security;
+    bool passwordSet;
+};
+
+bool getActiveWifiConfig(ActiveWifiConfig& config);
+void enterDebugNetworkMode();
+void leaveDebugNetworkMode();
+bool isDebugNetworkMode();
+
 
 #endif

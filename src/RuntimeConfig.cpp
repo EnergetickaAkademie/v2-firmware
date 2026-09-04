@@ -56,7 +56,8 @@ void initRuntimeConfig() {
     otaPort = preferences.getUShort("port", OTA_PORT);
     ready = schema >= DEVICE_CONFIG_SCHEMA && validValue(apiUrl) &&
         validValue(boardUsername) && validValue(boardPassword) &&
-        otaPassword.length() >= 8 && otaHostname.length() > 0;
+        otaPassword.length() >= 8 && otaHostname.length() > 0 &&
+        otaPort > 0 && otaPort != 80;
     if (!ready) Serial.println("[Config] Device is not provisioned for generic OTA releases.");
 }
 
@@ -68,3 +69,38 @@ const String& runtimeBoardPassword() { return boardPassword; }
 const String& runtimeOtaPassword() { return otaPassword; }
 const String& runtimeOtaHostname() { return otaHostname; }
 uint16_t runtimeOtaPort() { return otaPort; }
+
+bool saveRuntimeConfig(const String& nextApiUrl, const String& nextBoardUsername,
+                      const String& nextBoardPassword, const String& nextOtaPassword,
+                      const String& nextOtaHostname, uint16_t nextOtaPort) {
+    if (!validValue(nextApiUrl) || !validValue(nextBoardUsername) ||
+        !validValue(nextBoardPassword) || nextOtaPassword.length() < 8 ||
+        nextOtaPassword.length() > 127 || nextOtaHostname.length() == 0 ||
+        nextOtaHostname.length() > 63 || nextOtaPort == 0 || nextOtaPort == 80) {
+        return false;
+    }
+
+    bool ok = preferences.putString("api", nextApiUrl) > 0;
+    ok = ok && preferences.putString("user", nextBoardUsername) > 0;
+    ok = ok && preferences.putString("pass", nextBoardPassword) > 0;
+    ok = ok && preferences.putString("ota", nextOtaPassword) > 0;
+    ok = ok && preferences.putString("host", nextOtaHostname) > 0;
+    ok = ok && preferences.putUShort("port", nextOtaPort) > 0;
+    if (ok) {
+        ok = preferences.putUChar("schema", DEVICE_CONFIG_SCHEMA) > 0;
+    }
+    if (!ok) {
+        Serial.println("[Config] Failed to persist debug-portal configuration.");
+        return false;
+    }
+
+    apiUrl = nextApiUrl;
+    boardUsername = nextBoardUsername;
+    boardPassword = nextBoardPassword;
+    otaPassword = nextOtaPassword;
+    otaHostname = nextOtaHostname;
+    otaPort = nextOtaPort;
+    schema = DEVICE_CONFIG_SCHEMA;
+    ready = true;
+    return true;
+}

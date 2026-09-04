@@ -45,6 +45,10 @@
 	#define OTA_PORT 8080
 #endif
 
+#ifndef DEBUG_AP_PASSWORD
+	#define DEBUG_AP_PASSWORD "enak-debug"
+#endif
+
 #ifndef FIRMWARE_VERSION
 	#define FIRMWARE_VERSION "dev"
 #endif

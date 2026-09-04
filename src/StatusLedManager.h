@@ -36,5 +36,6 @@ void statusLedSetSubstationCount(uint8_t count);
 void statusLedSetNfcAvailable(bool available);
 void statusLedNotifyNfcEvent(StatusNfcEvent event);
 void statusLedSetOtaState(StatusOtaState state);
+void statusLedSetDebugMode(bool active);
 
 #endif
