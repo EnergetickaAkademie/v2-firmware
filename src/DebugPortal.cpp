@@ -5,7 +5,9 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 
 #include "Config.h"
 #include "DebugLog.h"
@@ -13,6 +15,7 @@
 #include "NetworkManager.h"
 #include "NfcDebug.h"
 #include "MainboardDebug.h"
+#include "OtaManager.h"
 #include "RuntimeConfig.h"
 #include "StatusLedManager.h"
 #include "SubstationManager.h"
@@ -25,10 +28,34 @@ namespace {
 WebServer portalServer(80);
 DNSServer dnsServer;
 volatile bool requested = false;
+volatile bool exitRequested = false;
 bool active = false;
 bool restartPending = false;
 uint32_t restartAtMs = 0;
 String requestToken;
+
+constexpr uint32_t DEBUG_OTA_QUIESCE_TIMEOUT_MS = 15000;
+const esp_partition_t* stagedFirmwarePartition = nullptr;
+esp_ota_handle_t firmwareUploadHandle = 0;
+bool firmwareUploadHandleActive = false;
+bool firmwareUploadAuthorized = false;
+bool firmwareUploadActive = false;
+bool firmwareUploadRequestActive = false;
+bool firmwareBinarySeen = false;
+bool firmwareChecksumSeen = false;
+bool firmwareHashMatched = false;
+bool stagedFirmwareReady = false;
+size_t firmwareUploadBytes = 0;
+String firmwareUploadFilename;
+String firmwareUploadSha256;
+String firmwareExpectedSha256;
+String firmwareChecksumText;
+String firmwareUploadError;
+mbedtls_sha256_context firmwareUploadDigest;
+bool firmwareUploadDigestActive = false;
+
+enum class FirmwareUploadPart : uint8_t { None, Binary, Sha256 };
+FirmwareUploadPart firmwareUploadPart = FirmwareUploadPart::None;
 
 bool tokenValid();
 
@@ -47,6 +74,299 @@ void sendError(int code, const char* message) {
     JsonDocument doc;
     doc["error"] = message;
     sendJson(code, doc);
+}
+
+String sha256Hex(const uint8_t digest[32]) {
+    String result;
+    result.reserve(64);
+    const char* digits = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        result += digits[(digest[i] >> 4) & 0x0f];
+        result += digits[digest[i] & 0x0f];
+    }
+    return result;
+}
+
+bool isSha256Hex(char value) {
+    return (value >= '0' && value <= '9') ||
+           (value >= 'a' && value <= 'f') ||
+           (value >= 'A' && value <= 'F');
+}
+
+String parseSha256File(const String& input) {
+    String text = input;
+    text.trim();
+    size_t tokenLength = 0;
+    while (tokenLength < text.length() && text.charAt(tokenLength) > ' ') {
+        ++tokenLength;
+    }
+    if (tokenLength != 64) return "";
+    for (size_t index = 0; index < tokenLength; ++index) {
+        if (!isSha256Hex(text.charAt(index))) return "";
+    }
+    String result = text.substring(0, tokenLength);
+    result.toLowerCase();
+    return result;
+}
+
+void discardStagedFirmware() {
+    stagedFirmwarePartition = nullptr;
+    stagedFirmwareReady = false;
+    firmwareUploadBytes = 0;
+    firmwareUploadFilename = "";
+    firmwareUploadSha256 = "";
+}
+
+void failFirmwareUpload(const String& message) {
+    if (firmwareUploadHandleActive) {
+        esp_ota_abort(firmwareUploadHandle);
+        firmwareUploadHandleActive = false;
+    }
+    if (firmwareUploadDigestActive) {
+        mbedtls_sha256_free(&firmwareUploadDigest);
+        firmwareUploadDigestActive = false;
+    }
+    setOtaDebugUpdateInProgress(false);
+    statusLedSetOtaState(StatusOtaState::Failed);
+    firmwareUploadActive = false;
+    firmwareUploadError = message;
+    discardStagedFirmware();
+}
+
+bool waitForOtaTasks() {
+    const uint32_t startedAt = millis();
+    while (!otaTasksPaused() && millis() - startedAt < DEBUG_OTA_QUIESCE_TIMEOUT_MS) {
+        delay(10);
+    }
+    return otaTasksPaused();
+}
+
+void handleFirmwareStatusGet() {
+    if (!tokenValid()) { sendError(403, "Invalid debug session token"); return; }
+    JsonDocument doc;
+    doc["ready"] = stagedFirmwareReady;
+    doc["filename"] = firmwareUploadFilename;
+    doc["size"] = firmwareUploadBytes;
+    doc["sha256"] = firmwareUploadSha256;
+    doc["hash_provided"] = firmwareChecksumSeen;
+    doc["hash_matched"] = firmwareHashMatched;
+    if (firmwareUploadError.length() > 0) doc["error"] = firmwareUploadError;
+    sendJson(200, doc);
+}
+
+void handleFirmwareUpdatePost() {
+    if (!tokenValid()) { sendError(403, "Invalid debug session token"); return; }
+    if (!stagedFirmwareReady || stagedFirmwarePartition == nullptr) {
+        sendError(409, "Upload and verify a firmware image first");
+        return;
+    }
+    if (isOtaInProgress()) {
+        sendError(409, "Another firmware operation is already in progress");
+        return;
+    }
+    if (esp_ota_set_boot_partition(stagedFirmwarePartition) != ESP_OK) {
+        sendError(500, "Could not select the verified firmware partition");
+        return;
+    }
+
+    JsonDocument response;
+    response["ok"] = true;
+    response["rebooting"] = true;
+    response["sha256"] = firmwareUploadSha256;
+    response["hash_matched"] = firmwareHashMatched;
+    sendJson(200, response);
+    statusLedSetOtaState(StatusOtaState::Succeeded);
+    restartPending = true;
+    restartAtMs = millis() + 700;
+}
+
+void handleFirmwareUploadFinished() {
+    if (!firmwareUploadAuthorized) {
+        sendError(401, "Invalid debug session token");
+        firmwareUploadRequestActive = false;
+        return;
+    }
+    if (firmwareUploadError.length() > 0) {
+        sendError(400, firmwareUploadError.c_str());
+        firmwareUploadRequestActive = false;
+        firmwareUploadAuthorized = false;
+        return;
+    }
+    if (!firmwareBinarySeen || stagedFirmwarePartition == nullptr) {
+        firmwareUploadError = "A .bin firmware file is required";
+        sendError(400, firmwareUploadError.c_str());
+        firmwareUploadRequestActive = false;
+        firmwareUploadAuthorized = false;
+        return;
+    }
+    if (firmwareChecksumSeen) {
+        firmwareExpectedSha256 = parseSha256File(firmwareChecksumText);
+        if (firmwareExpectedSha256.length() == 0) {
+            failFirmwareUpload("The .sha256 file does not contain a valid SHA-256 hash");
+            sendError(400, firmwareUploadError.c_str());
+            firmwareUploadRequestActive = false;
+            firmwareUploadAuthorized = false;
+            return;
+        }
+        firmwareHashMatched = firmwareExpectedSha256 == firmwareUploadSha256;
+        if (!firmwareHashMatched) {
+            failFirmwareUpload("The .sha256 hash does not match the uploaded firmware");
+            sendError(400, firmwareUploadError.c_str());
+            firmwareUploadRequestActive = false;
+            firmwareUploadAuthorized = false;
+            return;
+        }
+    }
+    stagedFirmwareReady = true;
+
+    JsonDocument response;
+    response["ok"] = true;
+    response["verified"] = true;
+    response["filename"] = firmwareUploadFilename;
+    response["size"] = firmwareUploadBytes;
+    response["sha256"] = firmwareUploadSha256;
+    response["hash_provided"] = firmwareChecksumSeen;
+    response["hash_matched"] = firmwareHashMatched;
+    sendJson(200, response);
+    firmwareUploadRequestActive = false;
+    firmwareUploadAuthorized = false;
+}
+
+void handleFirmwareUploadChunk() {
+    HTTPUpload& upload = portalServer.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        String filename = upload.filename;
+        filename.toLowerCase();
+
+        if (!firmwareUploadRequestActive) {
+            firmwareUploadRequestActive = true;
+            firmwareUploadAuthorized = tokenValid();
+            firmwareUploadActive = false;
+            firmwareBinarySeen = false;
+            firmwareChecksumSeen = false;
+            firmwareHashMatched = false;
+            firmwareExpectedSha256 = "";
+            firmwareChecksumText = "";
+            firmwareUploadError = "";
+            discardStagedFirmware();
+            if (!firmwareUploadAuthorized) {
+                firmwareUploadError = "Invalid debug session token";
+                return;
+            }
+        }
+        if (!firmwareUploadAuthorized) return;
+        if (filename.endsWith(".sha256")) {
+            if (firmwareChecksumSeen) {
+                firmwareUploadError = "Only one .sha256 file may be uploaded";
+                return;
+            }
+            firmwareChecksumSeen = true;
+            firmwareChecksumText = "";
+            firmwareUploadPart = FirmwareUploadPart::Sha256;
+            return;
+        }
+        if (!filename.endsWith(".bin")) {
+            firmwareUploadError = "Upload a .bin firmware file and optionally a .sha256 file";
+            return;
+        }
+        if (firmwareBinarySeen || isOtaInProgress()) {
+            firmwareUploadError = firmwareBinarySeen
+                ? "Only one .bin firmware file may be uploaded"
+                : "Another firmware operation is already in progress";
+            return;
+        }
+
+        firmwareBinarySeen = true;
+        firmwareUploadFilename = upload.filename;
+        firmwareUploadPart = FirmwareUploadPart::Binary;
+
+        const esp_partition_t* partition = esp_ota_get_next_update_partition(nullptr);
+        if (partition == nullptr) {
+            firmwareUploadError = "No inactive OTA partition is available";
+            return;
+        }
+
+        stagedFirmwarePartition = partition;
+        setOtaDebugUpdateInProgress(true);
+        statusLedSetOtaState(StatusOtaState::Uploading);
+        if (!waitForOtaTasks()) {
+            failFirmwareUpload("Background tasks did not pause for firmware upload");
+            return;
+        }
+        if (esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &firmwareUploadHandle) != ESP_OK) {
+            failFirmwareUpload("Could not open the inactive OTA partition");
+            return;
+        }
+        firmwareUploadHandleActive = true;
+        mbedtls_sha256_init(&firmwareUploadDigest);
+        if (mbedtls_sha256_starts_ret(&firmwareUploadDigest, 0) != 0) {
+            failFirmwareUpload("Could not initialize SHA-256 verification");
+            return;
+        }
+        firmwareUploadDigestActive = true;
+        firmwareUploadActive = true;
+        return;
+    }
+
+    if (!firmwareUploadAuthorized) return;
+
+    if (firmwareUploadPart == FirmwareUploadPart::Sha256) {
+        if (upload.status == UPLOAD_FILE_WRITE) {
+            if (firmwareChecksumText.length() + upload.currentSize > 256) {
+                firmwareUploadError = "The .sha256 file is too large";
+                return;
+            }
+            for (size_t index = 0; index < upload.currentSize; ++index) {
+                firmwareChecksumText += static_cast<char>(upload.buf[index]);
+            }
+        }
+        return;
+    }
+
+    if (firmwareUploadPart != FirmwareUploadPart::Binary || !firmwareUploadActive) return;
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+        if (firmwareUploadBytes + upload.currentSize > stagedFirmwarePartition->size) {
+            failFirmwareUpload("Firmware image is larger than the inactive OTA partition");
+            return;
+        }
+        if (esp_ota_write(firmwareUploadHandle, upload.buf, upload.currentSize) != ESP_OK ||
+            mbedtls_sha256_update_ret(&firmwareUploadDigest, upload.buf, upload.currentSize) != 0) {
+            failFirmwareUpload("Firmware upload or SHA-256 calculation failed");
+            return;
+        }
+        firmwareUploadBytes += upload.currentSize;
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_END) {
+        uint8_t digest[32] = {};
+        if (firmwareUploadBytes == 0 ||
+            mbedtls_sha256_finish_ret(&firmwareUploadDigest, digest) != 0) {
+            failFirmwareUpload("Firmware image is empty or SHA-256 verification failed");
+            return;
+        }
+        mbedtls_sha256_free(&firmwareUploadDigest);
+        firmwareUploadDigestActive = false;
+        firmwareUploadSha256 = sha256Hex(digest);
+
+        if (esp_ota_end(firmwareUploadHandle) != ESP_OK) {
+            firmwareUploadHandleActive = false;
+            failFirmwareUpload("Firmware image validation failed");
+            return;
+        }
+        firmwareUploadHandleActive = false;
+        firmwareUploadActive = false;
+        setOtaDebugUpdateInProgress(false);
+        statusLedSetOtaState(StatusOtaState::Idle);
+        firmwareUploadError = "";
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_ABORTED) {
+        failFirmwareUpload("Firmware upload was aborted");
+    }
 }
 
 void redirectToPortal() {
@@ -444,6 +764,10 @@ void beginPortal() {
     });
     portalServer.on("/api/config", HTTP_GET, handleConfigGet);
     portalServer.on("/api/status", HTTP_GET, handleStatusGet);
+    portalServer.on("/api/firmware/status", HTTP_GET, handleFirmwareStatusGet);
+    portalServer.on("/api/firmware/update", HTTP_POST, handleFirmwareUpdatePost);
+    portalServer.on("/api/firmware/upload", HTTP_POST, handleFirmwareUploadFinished,
+                    handleFirmwareUploadChunk);
     portalServer.on("/api/encoder", HTTP_POST, handleEncoderControlPost);
     portalServer.on("/api/nfc/status", HTTP_GET, handleNfcStatusGet);
     portalServer.on("/api/config", HTTP_POST, handleConfigPost);
@@ -468,10 +792,16 @@ void beginPortal() {
 } // namespace
 
 void requestDebugPortal() { requested = true; }
+void requestDebugPortalExit() { exitRequested = true; }
 bool isDebugPortalRequested() { return requested; }
 bool isDebugPortalActive() { return active; }
 
 void handleDebugPortal() {
+    if (exitRequested) {
+        exitRequested = false;
+        requested = false;
+        if (active) stopPortal();
+    }
     if (requested && !active) beginPortal();
     if (!active) return;
     dnsServer.processNextRequest();

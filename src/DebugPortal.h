@@ -4,6 +4,7 @@
 #include <Arduino.h>
 
 void requestDebugPortal();
+void requestDebugPortalExit();
 bool isDebugPortalRequested();
 bool isDebugPortalActive();
 void handleDebugPortal();

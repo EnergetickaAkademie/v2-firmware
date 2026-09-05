@@ -38,6 +38,7 @@ volatile bool networkTaskRunning = false;
 volatile bool networkTaskPausedForOta = false;
 volatile bool nfcTaskRunning = false;
 volatile bool nfcTaskPausedForOta = false;
+volatile bool debugUpdateInProgress = false;
 bool uploadAuthorized = false;
 bool uploadSucceeded = false;
 bool restartPending = false;
@@ -327,7 +328,16 @@ void handleOta() {
 }
 
 bool isOtaInProgress() {
-    return updateInProgress || pullUpdateInProgress;
+    return updateInProgress || pullUpdateInProgress || debugUpdateInProgress;
+}
+
+void setOtaDebugUpdateInProgress(bool active) {
+    debugUpdateInProgress = active;
+}
+
+bool otaTasksPaused() {
+    return (!networkTaskRunning || networkTaskPausedForOta) &&
+           (!nfcTaskRunning || nfcTaskPausedForOta);
 }
 
 void setOtaNetworkTaskPaused(bool paused) {

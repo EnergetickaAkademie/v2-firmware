@@ -261,17 +261,30 @@ bool readUltralightNdef(uint8_t* data, size_t& dataLength) {
 bool readMifareNdef(uint8_t* uid, uint8_t uidLength, uint8_t* data, size_t& dataLength) {
 	uint8_t keyNdef[6] = {0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7};
 	uint8_t keyUniversal[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-	if (!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyNdef) &&
-		!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, 4, 0, keyUniversal)) {
-		return false;
-	}
 	memset(data, 0, NTAG213_USER_BYTES);
 	size_t dataOffset = 0;
 	for (uint8_t block = 4; block < 16; ++block) {
 		if (nfc.mifareclassic_IsTrailerBlock(block)) continue;
 		if (dataOffset + 16 > NTAG213_USER_BYTES) break;
+		// Classic authentication is scoped to one sector.  Re-authenticate at
+		// every sector boundary instead of carrying sector 1's session forward.
+		if ((block - 4) % 4 == 0 &&
+			!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, block, 0, keyNdef) &&
+			!nfc.mifareclassic_AuthenticateBlock(uid, uidLength, block, 0, keyUniversal)) {
+			return false;
+		}
 		if (!nfc.mifareclassic_ReadDataBlock(block, data + dataOffset)) return false;
 		dataOffset += 16;
+		// Once the complete TLV is available, stop.  This avoids touching
+		// unrelated later sectors on cards that only have the NDEF area
+		// formatted, while still allowing longer records to span sectors.
+		size_t messageOffset = 0;
+		size_t messageLength = 0;
+		if (findNdefMessage(data, dataOffset, messageOffset, messageLength) &&
+			messageOffset + messageLength <= dataOffset) {
+			dataLength = messageOffset + messageLength;
+			return true;
+		}
 	}
 	dataLength = dataOffset;
 	size_t messageOffset = 0;
@@ -280,6 +293,22 @@ bool readMifareNdef(uint8_t* uid, uint8_t uidLength, uint8_t* data, size_t& data
 	if (messageOffset + messageLength > dataLength) return false;
 	dataLength = messageOffset + messageLength;
 	return true;
+}
+
+bool readDebugNdef(uint8_t* uid, uint8_t uidLength, uint8_t* data,
+				  size_t& dataLength, bool& classic) {
+	classic = false;
+	// MIFARE Classic cards may use either a 4-byte or 7-byte UID.  Try the
+	// Classic NDEF mapping first so Android-written Classic 1K tags are not
+	// mistaken for NTAG/Ultralight solely because their UID is 7 bytes long.
+	if (uidLength == 4 || uidLength == 7) {
+		if (readMifareNdef(uid, uidLength, data, dataLength)) {
+			classic = true;
+			return true;
+		}
+	}
+	if (uidLength == 7 && readUltralightNdef(data, dataLength)) return true;
+	return false;
 }
 
 bool buildDebugNdef(const NfcDebugProfile& profile, uint8_t* output,
@@ -375,17 +404,22 @@ bool ndefPayloadMatches(const uint8_t* data, size_t dataLength,
 						const uint8_t* message, size_t messageLength) {
 	size_t messageOffset = 0;
 	size_t foundLength = 0;
+	// The write buffer contains the complete Type 2 TLV: one byte for the
+	// tag, one byte for the length, the NDEF record, and the terminator. The
+	// parser reports only the NDEF record length.
+	if (messageLength < 3) return false;
+	const size_t expectedRecordLength = messageLength - 3;
 	if (!findNdefMessage(data, dataLength, messageOffset, foundLength) ||
-		foundLength != messageLength || messageOffset + foundLength > dataLength) return false;
-	return memcmp(data + messageOffset, message + 2, messageLength) == 0;
+		foundLength != expectedRecordLength || messageOffset + foundLength > dataLength) return false;
+	return memcmp(data + messageOffset, message + 2, expectedRecordLength) == 0;
 }
 
 void processDebugNfcTag(uint8_t* uid, uint8_t uidLength, const String& uidStr,
 						NfcDebugMode mode) {
 	NfcDebugEvent event;
 	event.uid = uidStr;
-	event.technology = uidLength == 7 ? "NTAG/Ultralight" :
-		(uidLength == 4 ? "MIFARE Classic" : "ISO14443A");
+	event.technology = uidLength == 4 ? "MIFARE Classic" :
+		(uidLength == 7 ? "NTAG/Ultralight" : "ISO14443A");
 	event.recordType = "Unknown";
 	event.protocol = "unknown";
 	event.detail = "Tag memory read failed";
@@ -393,9 +427,9 @@ void processDebugNfcTag(uint8_t* uid, uint8_t uidLength, const String& uidStr,
 
 	uint8_t data[NTAG213_USER_BYTES] = {};
 	size_t dataLength = 0;
-	bool readSuccess = false;
-	if (uidLength == 7) readSuccess = readUltralightNdef(data, dataLength);
-	else if (uidLength == 4) readSuccess = readMifareNdef(uid, uidLength, data, dataLength);
+	bool classicTag = false;
+	const bool readSuccess = readDebugNdef(uid, uidLength, data, dataLength, classicTag);
+	if (classicTag) event.technology = "MIFARE Classic";
 
 	NdefRecordView record;
 	const bool ndefFound = readSuccess && parseFirstNdefRecord(data, dataLength, record);
@@ -429,19 +463,23 @@ void processDebugNfcTag(uint8_t* uid, uint8_t uidLength, const String& uidStr,
 		const bool built = buildDebugNdef(profile, message, sizeof(message), messageLength, type);
 		bool written = false;
 		if (built) {
-			if (uidLength == 7) written = writeUltralightNdef(message, messageLength);
-			else if (uidLength == 4) written = writeMifareNdef(uid, uidLength, message, messageLength);
+			if (classicTag || uidLength == 4) written = writeMifareNdef(uid, uidLength, message, messageLength);
+			else if (uidLength == 7) written = writeUltralightNdef(message, messageLength);
 		}
 		event.recordType = type.length() > 0 ? type : event.recordType;
 		event.detail = !built ? "Invalid write profile or tag capacity" :
 			(!written ? "NDEF write failed or tag unsupported" : "NDEF written and verified");
 		event.success = false;
 		if (written) {
-			uint8_t verify[NTAG213_USER_BYTES] = {};
-			size_t verifyLength = 0;
-			const bool verifiedRead = uidLength == 7 ? readUltralightNdef(verify, verifyLength) :
-				readMifareNdef(uid, uidLength, verify, verifyLength);
-			event.success = verifiedRead && ndefPayloadMatches(verify, verifyLength, message, messageLength);
+			for (uint8_t attempt = 0; attempt < 3 && !event.success; ++attempt) {
+				if (attempt > 0) delay(75);
+				uint8_t verify[NTAG213_USER_BYTES] = {};
+				size_t verifyLength = 0;
+				const bool verifiedRead = classicTag || uidLength == 4
+					? readMifareNdef(uid, uidLength, verify, verifyLength)
+					: uidLength == 7 && readUltralightNdef(verify, verifyLength);
+				event.success = verifiedRead && ndefPayloadMatches(verify, verifyLength, message, messageLength);
+			}
 			if (!event.success) event.detail = "NDEF write completed but verification failed";
 		}
 	}
@@ -722,13 +760,16 @@ void nfcTaskImpl(void *pvParameters) {
 				}
 				if (!debugExecuted && debugArmedUid == uidStr &&
 					millis() - debugArmedAtMs >= DEBUG_HOLD_MS) {
-					requestDebugPortal();
+					const bool stopping = isDebugPortalActive();
+					if (stopping) requestDebugPortalExit();
+					else requestDebugPortal();
 					debugExecuted = true;
 					statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
-					Serial.println("[NFC] Debug card hold confirmed; starting local portal.");
-					tone(BUZZER_PIN, 1900, 120);
+					Serial.printf("[NFC] Debug card hold confirmed; %s local portal.\n",
+						stopping ? "stopping" : "starting");
+					tone(BUZZER_PIN, stopping ? 2400 : 1900, 120);
 					vTaskDelay(pdMS_TO_TICKS(140));
-					tone(BUZZER_PIN, 2600, 220);
+					tone(BUZZER_PIN, stopping ? 1400 : 2600, 220);
 				}
 				vTaskDelay(pdMS_TO_TICKS(100));
 				continue;
@@ -744,12 +785,9 @@ void nfcTaskImpl(void *pvParameters) {
 			uint8_t data[NTAG213_USER_BYTES] = {0};
 			size_t dataLength = 0;
 			bool readSuccess = false;
-
-			if (uidLength == 7) {
-				readSuccess = readUltralightNdef(data, dataLength);
-			} else if (uidLength == 4) {
-				readSuccess = readMifareNdef(uid, uidLength, data, dataLength);
-			}
+			bool classicTag = false;
+			readSuccess = readDebugNdef(uid, uidLength, data, dataLength, classicTag);
+			(void)classicTag; // Normal-mode handling is protocol-based; technology is only diagnostic in debug mode.
 
 			if (readSuccess) {
 				NdefRecordView record;

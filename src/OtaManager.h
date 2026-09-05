@@ -6,6 +6,8 @@
 void setupOta();
 void handleOta();
 bool isOtaInProgress();
+void setOtaDebugUpdateInProgress(bool active);
+bool otaTasksPaused();
 void setOtaNetworkTaskRunning(bool running);
 void setOtaNetworkTaskPaused(bool paused);
 void setOtaNfcTaskRunning(bool running);
