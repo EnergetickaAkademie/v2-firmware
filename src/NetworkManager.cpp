@@ -1233,6 +1233,32 @@ bool sendAddBuilding(uint8_t type, const String& uid) {
     return success;
 }
 
+bool removeBuildingFromServer(const String& uid) {
+    if (jwtToken == "" || WiFi.status() != WL_CONNECTED || uid.length() == 0) {
+        return false;
+    }
+
+    HTTPClient http;
+    http.begin(runtimeApiBaseUrl() + "/board/remove_building");
+    http.addHeader("Authorization", "Bearer " + jwtToken);
+    http.addHeader("Content-Type", "text/plain");
+
+    const int code = http.POST(uid);
+    const bool success = code >= 200 && code < 300;
+    if (!success) {
+        if (!handleAuthFailure(code, "/board/remove_building") &&
+            !handleBoardNotFound(http, code, "/board/remove_building")) {
+            logHttpFailure("/board/remove_building", code);
+        }
+    } else {
+        Serial.printf("[Net] removeBuildingFromServer succeeded. HTTP code: %d\n", code);
+        statusLedRecordApiSuccess();
+    }
+
+    http.end();
+    return success;
+}
+
 void pollBuildingCounts() {
     if (jwtToken == "" || WiFi.status() != WL_CONNECTED) return;
 

@@ -14,6 +14,7 @@ String boardUsername;
 String boardPassword;
 String otaPassword;
 String otaHostname;
+String debugApPassword = DEBUG_AP_PASSWORD;
 uint16_t otaPort = OTA_PORT;
 uint8_t schema = 0;
 bool ready = false;
@@ -46,6 +47,11 @@ void initRuntimeConfig() {
             schema = DEVICE_CONFIG_SCHEMA;
             Serial.println("[Config] Migrated compile-time device settings to NVS.");
         }
+        if (!preferences.isKey("debug_ap")) {
+            preferences.putString("debug_ap", DEBUG_AP_PASSWORD);
+        }
+        preferences.putUChar("schema", DEVICE_CONFIG_SCHEMA);
+        schema = DEVICE_CONFIG_SCHEMA;
     }
 
     apiUrl = preferences.getString("api", "");
@@ -53,6 +59,10 @@ void initRuntimeConfig() {
     boardPassword = preferences.getString("pass", "");
     otaPassword = preferences.getString("ota", "");
     otaHostname = preferences.getString("host", OTA_HOSTNAME);
+    debugApPassword = preferences.getString("debug_ap", DEBUG_AP_PASSWORD);
+    if (debugApPassword.length() < 8 || debugApPassword.length() > 63) {
+        debugApPassword = DEBUG_AP_PASSWORD;
+    }
     otaPort = preferences.getUShort("port", OTA_PORT);
     ready = schema >= DEVICE_CONFIG_SCHEMA && validValue(apiUrl) &&
         validValue(boardUsername) && validValue(boardPassword) &&
@@ -68,15 +78,18 @@ const String& runtimeBoardUsername() { return boardUsername; }
 const String& runtimeBoardPassword() { return boardPassword; }
 const String& runtimeOtaPassword() { return otaPassword; }
 const String& runtimeOtaHostname() { return otaHostname; }
+const String& runtimeDebugApPassword() { return debugApPassword; }
 uint16_t runtimeOtaPort() { return otaPort; }
 
 bool saveRuntimeConfig(const String& nextApiUrl, const String& nextBoardUsername,
                       const String& nextBoardPassword, const String& nextOtaPassword,
-                      const String& nextOtaHostname, uint16_t nextOtaPort) {
+                      const String& nextOtaHostname, uint16_t nextOtaPort,
+                      const String& nextDebugApPassword) {
     if (!validValue(nextApiUrl) || !validValue(nextBoardUsername) ||
         !validValue(nextBoardPassword) || nextOtaPassword.length() < 8 ||
         nextOtaPassword.length() > 127 || nextOtaHostname.length() == 0 ||
-        nextOtaHostname.length() > 63 || nextOtaPort == 0 || nextOtaPort == 80) {
+        nextOtaHostname.length() > 63 || nextOtaPort == 0 || nextOtaPort == 80 ||
+        nextDebugApPassword.length() < 8 || nextDebugApPassword.length() > 63) {
         return false;
     }
 
@@ -86,6 +99,7 @@ bool saveRuntimeConfig(const String& nextApiUrl, const String& nextBoardUsername
     ok = ok && preferences.putString("ota", nextOtaPassword) > 0;
     ok = ok && preferences.putString("host", nextOtaHostname) > 0;
     ok = ok && preferences.putUShort("port", nextOtaPort) > 0;
+    ok = ok && preferences.putString("debug_ap", nextDebugApPassword) > 0;
     if (ok) {
         ok = preferences.putUChar("schema", DEVICE_CONFIG_SCHEMA) > 0;
     }
@@ -99,6 +113,7 @@ bool saveRuntimeConfig(const String& nextApiUrl, const String& nextBoardUsername
     boardPassword = nextBoardPassword;
     otaPassword = nextOtaPassword;
     otaHostname = nextOtaHostname;
+    debugApPassword = nextDebugApPassword;
     otaPort = nextOtaPort;
     schema = DEVICE_CONFIG_SCHEMA;
     ready = true;

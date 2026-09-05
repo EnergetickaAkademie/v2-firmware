@@ -9,6 +9,7 @@ void startNetworkTask();
 
 bool queueWifiProvisioning(const String& ssid, const String& password, uint8_t security);
 bool sendAddBuilding(uint8_t type, const String& uid);
+bool removeBuildingFromServer(const String& uid);
 void pollBuildingCounts();
 void applyMqttFirmwareMode(bool active);
 

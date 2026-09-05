@@ -164,6 +164,46 @@ bool hasBuildingBeenScanned(const String& uid) {
 	return duplicate;
 }
 
+std::vector<ScannedBuilding> scannedBuildingsSnapshot() {
+	std::vector<ScannedBuilding> snapshot;
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return snapshot;
+	}
+
+	snapshot = scannedBuildings;
+	xSemaphoreGive(pendingMutex);
+	return snapshot;
+}
+
+bool removeScannedBuilding(const String& uid) {
+	if (pendingMutex == nullptr ||
+		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {
+		return false;
+	}
+
+	bool removed = false;
+	for (auto it = scannedBuildings.begin(); it != scannedBuildings.end();) {
+		if (it->uid == uid) {
+			it = scannedBuildings.erase(it);
+			removed = true;
+		} else {
+			++it;
+		}
+	}
+	for (auto it = pendingBuildings.begin(); it != pendingBuildings.end();) {
+		if (it->uid == uid) {
+			it = pendingBuildings.erase(it);
+		} else {
+			++it;
+		}
+	}
+
+	xSemaphoreGive(pendingMutex);
+	if (removed) persistPendingBuildingQueue();
+	return removed;
+}
+
 void setBuildingScanScenarioState(bool active, bool resetCache) {
 	if (pendingMutex == nullptr ||
 		xSemaphoreTake(pendingMutex, portMAX_DELAY) != pdTRUE) {

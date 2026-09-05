@@ -55,6 +55,8 @@ enum class BuildingScanQueueResult {
 void initPersistentGameState();
 BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type);
 bool hasBuildingBeenScanned(const String& uid);
+std::vector<ScannedBuilding> scannedBuildingsSnapshot();
+bool removeScannedBuilding(const String& uid);
 void setBuildingScanScenarioState(bool active, bool resetCache);
 void requestBuildingReset();
 bool isBuildingResetPending();

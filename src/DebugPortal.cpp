@@ -472,6 +472,56 @@ void handleNfcStatusGet() {
     sendJson(200, doc);
 }
 
+void handleBuildingsGet() {
+    if (!tokenValid()) { sendError(403, "Invalid debug session token"); return; }
+
+    JsonDocument doc;
+    JsonArray buildings = doc["buildings"].to<JsonArray>();
+    const std::vector<ScannedBuilding> snapshot = scannedBuildingsSnapshot();
+    for (const auto& building : snapshot) {
+        JsonObject object = buildings.add<JsonObject>();
+        object["uid"] = building.uid;
+        object["building_type"] = building.type;
+    }
+    sendJson(200, doc);
+}
+
+void handleBuildingRemovePost() {
+    if (!tokenValid()) { sendError(403, "Invalid debug session token"); return; }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, portalServer.arg("plain"))) {
+        sendError(400, "Request must be valid JSON");
+        return;
+    }
+    const String uid = doc["uid"].as<String>();
+    if (uid.length() == 0 || uid.length() > 64) {
+        sendError(400, "Building UID must be 1-64 characters");
+        return;
+    }
+
+    setOtaDebugUpdateInProgress(true);
+    if (!waitForOtaTasks()) {
+        setOtaDebugUpdateInProgress(false);
+        sendError(503, "Background tasks did not pause for building removal");
+        return;
+    }
+    const bool removedFromServer = removeBuildingFromServer(uid);
+    if (!removedFromServer) {
+        setOtaDebugUpdateInProgress(false);
+        sendError(502, "Could not remove building from CoreAPI; it was not removed locally");
+        return;
+    }
+
+    const bool removedLocally = removeScannedBuilding(uid);
+    setOtaDebugUpdateInProgress(false);
+    JsonDocument response;
+    response["ok"] = true;
+    response["uid"] = uid;
+    response["removed_from_scan"] = removedLocally;
+    sendJson(200, response);
+}
+
 void handleNfcModePost() {
     if (!tokenValid()) { sendError(403, "Invalid debug session token"); return; }
     JsonDocument doc;
@@ -574,6 +624,7 @@ void handleConfigGet() {
     doc["wifi_password_set"] = wifi.passwordSet;
     doc["board_password_set"] = runtimeBoardPassword().length() > 0;
     doc["ota_password_set"] = runtimeOtaPassword().length() >= 8;
+    doc["debug_ap_password_set"] = runtimeDebugApPassword().length() >= 8;
     doc["ota_hostname"] = runtimeOtaHostname();
     doc["ota_port"] = runtimeOtaPort();
     sendJson(200, doc);
@@ -657,6 +708,7 @@ void handleConfigPost() {
     const String nextHostname = doc["ota_hostname"].as<String>();
     const String boardPasswordInput = doc["board_password"].as<String>();
     const String otaPasswordInput = doc["ota_password"].as<String>();
+    const String debugApPasswordInput = doc["debug_ap_password"].as<String>();
     const int nextPort = doc["ota_port"].as<int>();
 
     if (!validBoardUsername(nextUsername)) {
@@ -681,9 +733,12 @@ void handleConfigPost() {
         ? boardPasswordInput : runtimeBoardPassword();
     const String nextOtaPassword = otaPasswordInput.length() > 0
         ? otaPasswordInput : runtimeOtaPassword();
+    const String nextDebugApPassword = debugApPasswordInput.length() > 0
+        ? debugApPasswordInput : runtimeDebugApPassword();
     if (nextBoardPassword.length() == 0 || nextBoardPassword.length() > 127 ||
-        nextOtaPassword.length() < 8 || nextOtaPassword.length() > 127) {
-        sendError(400, "Board and OTA passwords are missing or invalid");
+        nextOtaPassword.length() < 8 || nextOtaPassword.length() > 127 ||
+        nextDebugApPassword.length() < 8 || nextDebugApPassword.length() > 63) {
+        sendError(400, "Board, OTA, or debug AP password is missing or invalid");
         return;
     }
 
@@ -707,7 +762,7 @@ void handleConfigPost() {
 
     if (!saveRuntimeConfig(nextApi, nextUsername, nextBoardPassword,
                            nextOtaPassword, nextHostname,
-                           static_cast<uint16_t>(nextPort))) {
+                           static_cast<uint16_t>(nextPort), nextDebugApPassword)) {
         sendError(500, "Could not save device configuration");
         return;
     }
@@ -745,7 +800,8 @@ void beginPortal() {
     requested = false;
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_NETMASK);
-    const char* password = strlen(DEBUG_AP_PASSWORD) >= 8 ? DEBUG_AP_PASSWORD : "enak-debug";
+    const String& debugPassword = runtimeDebugApPassword();
+    const char* password = debugPassword.length() >= 8 ? debugPassword.c_str() : "enak-debug";
     const String ssid = boardApName();
     const int channel = WiFi.status() == WL_CONNECTED ? WiFi.channel() : 1;
     if (!WiFi.softAP(ssid.c_str(), password, channel, false, 1)) {
@@ -770,6 +826,8 @@ void beginPortal() {
                     handleFirmwareUploadChunk);
     portalServer.on("/api/encoder", HTTP_POST, handleEncoderControlPost);
     portalServer.on("/api/nfc/status", HTTP_GET, handleNfcStatusGet);
+    portalServer.on("/api/buildings", HTTP_GET, handleBuildingsGet);
+    portalServer.on("/api/buildings/remove", HTTP_POST, handleBuildingRemovePost);
     portalServer.on("/api/config", HTTP_POST, handleConfigPost);
     portalServer.on("/api/nfc/mode", HTTP_POST, handleNfcModePost);
     portalServer.on("/api/nfc/profile", HTTP_POST, handleNfcProfilePost);
