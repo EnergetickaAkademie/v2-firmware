@@ -14,14 +14,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install platformio==6.1.19
+      - name: Generate API CA certificate header
+        run: python scripts/generate_api_ca_header.py
       - name: Build universal mainboard image
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-DFIRMWARE_VERSION=\"${TAG_VERSION#v}\" -DWIFI_SSID=\"__UNPROVISIONED__\" -DWIFI_PASS=\"__UNPROVISIONED__\" -DAPI_BASE_URL=\"__UNPROVISIONED__\" -DBOARD_USERNAME=\"__UNPROVISIONED__\" -DBOARD_PASSWORD=\"__UNPROVISIONED__\" -DOTA_PASSWORD=\"CHANGE_ME\""
+          export PLATFORMIO_BUILD_FLAGS="-DFIRMWARE_VERSION=\"${TAG_VERSION#v}\" -DWIFI_SSID=\"__UNPROVISIONED__\" -DWIFI_PASS=\"__UNPROVISIONED__\" -DAPI_BASE_URL=\"__UNPROVISIONED__\" -DBOARD_USERNAME=\"__UNPROVISIONED__\" -DBOARD_PASSWORD=\"__UNPROVISIONED__\" -DOTA_PASSWORD=\"CHANGE_ME\" -DENAK_MQTT_V3_ENABLED=0"
           pio run -e mainboard
           cp .pio/build/mainboard/firmware.bin mb_firmware.bin
           sha256sum mb_firmware.bin | awk '{print $1}' > mb_firmware.bin.sha256
