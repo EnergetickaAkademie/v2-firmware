@@ -21,7 +21,18 @@ stop if commands are absent for 2.5 seconds.
 3. Start `uploader.py`, select **Mainboard** and **Wi-Fi OTA**, then enter the board IP or mDNS hostname.
 4. The uploader builds `.pio/build/mainboard/firmware.bin` and sends it to the authenticated endpoint on port 8080.
 
-The OTA password must contain at least eight characters. OTA updates apply only to the ESP32-S3 mainboard; CH32V003 powerplant and substation boards still require their wired programmer.
+The OTA password must contain at least eight characters. OTA updates apply only to the ESP32-S3 mainboard; CH32V003 powerplant and substation boards still require their wired programmer. For HTTPS API endpoints, set api_ca_cert_file to a PEM root certificate file trusted by the board. The certificate is compiled into the firmware.
+
+### WebControl firmware artifacts
+
+The Mainboard form also contains release-artifact settings. Configure
+`firmware_download_url`, `firmware_artifact_dir`, `firmware_manifest_file`,
+`firmware_channel`, and `firmware_config_schema` in `uploader.conf`, then click
+**Build Firmware + Manifest**. The uploader builds the mainboard with the
+current Wi-Fi/API/OTA values, writes `mb_firmware.bin` to the artifact
+directory, calculates its SHA-256, and adds or replaces that version in the
+manifest file. Host the generated binary and manifest at the configured HTTPS
+locations before selecting the release in WebControl.
 
 For wired CH32V003 flashing, select **Powerplant** or **Substation** in
 `uploader.py`. Powerplants additionally require a device type and receive a
@@ -41,6 +52,27 @@ binary `POST /board/sync/v2` request every 500 ms. The response echoes the
 request sequence and carries a configuration revision, so a complete snapshot
 is validated before it replaces the local values. Firmware temporarily falls
 back to the legacy endpoints when CoreAPI does not yet expose the v2 route.
+
+The normal `mainboard` environment prefers MQTT v3 and automatically falls
+back to this HTTP endpoint. For a broker-independent recovery image, build
+`pio run -e mainboard_http_v2`; it uses `/board/sync/v2` exclusively and keeps
+the board's existing NVS provisioning when installed over OTA.
+The graphical uploader exposes the same choice as the **Communication**
+checkbox; uncheck MQTT v3 before uploading to install the HTTP-only image.
+
+## NFC debug portal
+
+The NFC Flasher can write a v2 debug card (`cz.enak:cmd`, payload `02 02`).
+Hold it continuously on the mainboard reader for three seconds. The board then
+pauses cloud networking and exposes an AP named `ENAK-<board-username>` (or a
+chip-ID fallback) using the configured debug AP password, `enak-debug` by
+default. Join that AP and open `http://enak.local/`; captive-portal probes are
+redirected there automatically.
+
+The portal edits the supported device and network settings and shows live
+substation/powerplant diagnostics. Password fields are write-only. Saving or
+exiting reboots the board into normal operation; a Wi-Fi change is tested on
+the next boot and the previous network is restored if it cannot connect.
 
 ## Mainboard status LED
 
