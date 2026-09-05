@@ -23,7 +23,7 @@ jobs:
         env:
           TAG_VERSION: ${{ github.ref_name }}
         run: |
-          export PLATFORMIO_BUILD_FLAGS="-DFIRMWARE_VERSION=\"${TAG_VERSION#v}\" -DWIFI_SSID=\"__UNPROVISIONED__\" -DWIFI_PASS=\"__UNPROVISIONED__\" -DAPI_BASE_URL=\"__UNPROVISIONED__\" -DBOARD_USERNAME=\"__UNPROVISIONED__\" -DBOARD_PASSWORD=\"__UNPROVISIONED__\" -DOTA_PASSWORD=\"CHANGE_ME\" -DENAK_MQTT_V3_ENABLED=0"
+          export PLATFORMIO_BUILD_FLAGS="-DFIRMWARE_VERSION=\\\"${TAG_VERSION#v}\\\" -DWIFI_SSID=\\\"__UNPROVISIONED__\\\" -DWIFI_PASS=\\\"__UNPROVISIONED__\\\" -DAPI_BASE_URL=\\\"__UNPROVISIONED__\\\" -DBOARD_USERNAME=\\\"__UNPROVISIONED__\\\" -DBOARD_PASSWORD=\\\"__UNPROVISIONED__\\\" -DOTA_PASSWORD=\\\"CHANGE_ME\\\" -DENAK_MQTT_V3_ENABLED=0"
           pio run -e mainboard
           cp .pio/build/mainboard/firmware.bin mb_firmware.bin
           sha256sum mb_firmware.bin | awk '{print $1}' > mb_firmware.bin.sha256
