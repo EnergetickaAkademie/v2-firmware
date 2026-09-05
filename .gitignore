@@ -13,3 +13,4 @@ certs/
 !certs/
 !certs/isrgrootx1.pem
 src/GeneratedApiCaCert.h
+__pycache__/
