@@ -28,7 +28,7 @@ constexpr uint32_t NEBULIZER_COOLDOWN_MS = 5000;
 // Communication watchdog for continuously controlled motors only.
 // Nebulizers deliberately do NOT use this timeout: once switched on,
 // they remain on until an explicit CMD_MOTOR_OFF is received.
-constexpr uint32_t ACTUATOR_COMMAND_TIMEOUT_MS = 2500;
+constexpr uint32_t ACTUATOR_COMMAND_TIMEOUT_MS = 10000;
 
 constexpr uint32_t SOLAR_SAMPLE_INTERVAL_MS = 25;
 constexpr uint32_t SOLAR_LED_INTERVAL_MS = 100;

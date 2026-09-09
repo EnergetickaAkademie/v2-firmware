@@ -13,7 +13,46 @@ HardwareSerial subSerial1(0);
 HardwareSerial subSerial2(2);
 HardwareSerial subSerial3(1);
 
-int32_t lastSentValues[DEVICE_COUNT] = {-1, -1, -1, -1, -1, -1};
+struct PlantCommandState {
+    uint8_t rgbPercent[8];
+    uint8_t actuatorPercent[8];
+};
+
+void buildPlantCommandState(PlantCommandState& state) {
+    const float controlPercentages[8] = {
+        encoderPercentages[5], // Type 1 (Solar)
+        encoderPercentages[5], // Type 2 (Wind)
+        encoderPercentages[3], // Type 3 (Nuclear)
+        encoderPercentages[4], // Type 4 (Gas)
+        encoderPercentages[1], // Type 5 (Hydro)
+        encoderPercentages[2], // Type 6 (Pumped storage)
+        encoderPercentages[0], // Type 7 (Coal)
+        encoderPercentages[2]  // Type 8 (Battery)
+    };
+
+    for (uint8_t type = 1; type <= 8; ++type) {
+        const int requestedPercent = constrain(
+            static_cast<int>(controlPercentages[type - 1] * 100.0f),
+            0,
+            100
+        );
+
+        // Shared controls must not make an unavailable paired plant appear
+        // active. A zero coefficient means this individual type produces no
+        // power, even when the other type on the same control is at 100%.
+        state.rgbPercent[type - 1] = currentCoefficient[type] > 0.0f
+            ? static_cast<uint8_t>(requestedPercent)
+            : 0;
+        state.actuatorPercent[type - 1] = 0;
+    }
+
+    state.actuatorPercent[1] = state.rgbPercent[1]; // Wind
+    state.actuatorPercent[2] =
+        currentCoefficient[3] > 0.0f && encoderValuesMW[3] > 0 ? 100 : 0; // Nuclear
+    state.actuatorPercent[4] = state.rgbPercent[4]; // Hydro
+    state.actuatorPercent[6] =
+        currentCoefficient[7] > 0.0f && encoderValuesMW[0] > 0 ? 100 : 0; // Coal
+}
 
 struct Substation {
     HardwareSerial* port;
@@ -56,35 +95,14 @@ void sendPendingSubstationCommands() {
         if (!sub.online) continue;
 
         if (sub.needsBulkUpdate && (millis() - sub.lastCommandSendMs >= 150)) {
-            // Map encoder percentages to powerplant types 1-8
-            int pctMap[8] = {
-                (int)(encoderPercentages[5] * 100.0f), // Type 1 (Solar)
-                (int)(encoderPercentages[5] * 100.0f), // Type 2 (Wind)
-                (int)(encoderPercentages[3] * 100.0f), // Type 3 (Nuclear)
-                (int)(encoderPercentages[4] * 100.0f), // Type 4 (Gas)
-                (int)(encoderPercentages[1] * 100.0f), // Type 5 (Hydro)
-                (int)(encoderPercentages[2] * 100.0f), // Type 6 (PumpStor)
-                (int)(encoderPercentages[0] * 100.0f), // Type 7 (Coal)
-                (int)(encoderPercentages[2] * 100.0f)  // Type 8 (Battery)
-            };
-
-            uint8_t actuatorPct[8] = {
-                0,                                             // Type 1 (Solar)
-                (uint8_t)constrain(pctMap[1], 0, 100),         // Type 2 (Wind)
-                (uint8_t)(encoderValuesMW[3] > 0 ? 100 : 0),   // Type 3 (Nuclear)
-                0,                                             // Type 4 (Gas)
-                (uint8_t)constrain(pctMap[4], 0, 100),         // Type 5 (Hydro)
-                0,                                             // Type 6 (PumpStor)
-                (uint8_t)(encoderValuesMW[0] > 0 ? 100 : 0),   // Type 7 (Coal)
-                0                                              // Type 8 (Battery)
-            };
+            PlantCommandState commandState;
+            buildPlantCommandState(commandState);
 
             String rgbCmd = "ALLRGB";
             String motCmd = "ALLMOT";
 
             for (int i = 0; i < 8; i++) {
-                int pct = pctMap[i];
-                pct = constrain(pct, 0, 100);
+                const int pct = commandState.rgbPercent[i];
 
                 uint8_t r = 0, g = 0, b = 0;
                 
@@ -110,7 +128,8 @@ void sendPendingSubstationCommands() {
                 snprintf(buf, sizeof(buf), " %d %d %d", r, g, b);
                 rgbCmd += buf;
 
-                snprintf(buf, sizeof(buf), " %u", static_cast<unsigned>(actuatorPct[i]));
+                snprintf(buf, sizeof(buf), " %u",
+                    static_cast<unsigned>(commandState.actuatorPercent[i]));
                 motCmd += buf;
             }
 
@@ -183,20 +202,28 @@ void pollSubstations() {
 
 void queueSubstationUpdates() {
     static uint32_t lastUpdateCheckMs = 0;
+    static PlantCommandState lastCommandState = {};
+    static bool commandStateInitialized = false;
     
-    // Only check for encoder changes every 500ms (adjust this value to your liking)
+    // Check the complete outgoing command state every 500 ms. This includes
+    // coefficient-only changes that may leave a combined MW value unchanged.
     if (millis() - lastUpdateCheckMs < 500) {
         return; 
     }
     lastUpdateCheckMs = millis();
 
-    for (size_t i = 0; i < DEVICE_COUNT; ++i) {
-        int32_t val = encoderValuesMW[i];
-        if (val != lastSentValues[i]) {
-            lastSentValues[i] = val;
-            for(int s = 0; s < 3; s++) {
-                subs[s].needsBulkUpdate = true;
-            }
+    PlantCommandState currentCommandState;
+    buildPlantCommandState(currentCommandState);
+
+    if (!commandStateInitialized ||
+        memcmp(&currentCommandState, &lastCommandState,
+            sizeof(currentCommandState)) != 0) {
+
+        lastCommandState = currentCommandState;
+        commandStateInitialized = true;
+
+        for (int s = 0; s < 3; s++) {
+            subs[s].needsBulkUpdate = true;
         }
     }
 }

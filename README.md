@@ -11,7 +11,7 @@ resistor.
 Wind and hydro use proportional PWM with a 15% start threshold, a 300 ms
 kick-start, and a 10% stop threshold. Coal and nuclear use binary nebulizer
 control with a five-second restart lockout after shutdown. Active actuators
-stop if commands are absent for 2.5 seconds.
+stop if commands are absent for 10 seconds.
 
 
 ## ESP32-S3 mainboard OTA
