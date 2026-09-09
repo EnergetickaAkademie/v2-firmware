@@ -117,6 +117,8 @@ constexpr uint32_t DEBUG_HOLD_MS = 3000;
 constexpr uint8_t NFC_PROTOCOL_VERSION = 2;
 constexpr uint8_t ADMIN_COMMAND_RESET_BUILDINGS = 1;
 constexpr uint8_t ADMIN_COMMAND_ENTER_DEBUG = 2;
+constexpr uint8_t ADMIN_COMMAND_BULLDOZER = 3;
+constexpr uint32_t BULLDOZER_WINDOW_MS = 10000;
 constexpr uint8_t NDEF_TNF_EXTERNAL_TYPE = 0x04;
 
 struct NdefRecordView {
@@ -442,8 +444,10 @@ void processDebugNfcTag(uint8_t* uid, uint8_t uidLength, const String& uidStr,
 			event.success = event.buildingType < BUILDING_COUNT;
 		} else if (event.recordType == "cz.enak:cmd" && record.payloadLength == 2 && record.payload[0] == NFC_PROTOCOL_VERSION) {
 			event.detail = record.payload[1] == 1 ? "Building reset command" :
-				(record.payload[1] == 2 ? "Debug command" : "Unknown command");
-			event.success = record.payload[1] == 1 || record.payload[1] == 2;
+				(record.payload[1] == 2 ? "Debug command" :
+				(record.payload[1] == ADMIN_COMMAND_BULLDOZER ? "Bulldozer command" : "Unknown command"));
+			event.success = record.payload[1] == 1 || record.payload[1] == 2 ||
+				record.payload[1] == ADMIN_COMMAND_BULLDOZER;
 		} else if (event.recordType == "cz.enak:wifi") {
 			event.detail = "Wi-Fi provisioning record";
 			event.success = record.payloadLength >= 9 && record.payload[0] == NFC_PROTOCOL_VERSION;
@@ -697,6 +701,8 @@ void nfcTaskImpl(void *pvParameters) {
 	String debugArmedUid;
 	uint32_t debugArmedAtMs = 0;
 	bool debugExecuted = false;
+	bool bulldozerArmed = false;
+	uint32_t bulldozerExpiresAtMs = 0;
 	uint8_t consecutiveNoTagPolls = 0;
 	uint32_t noTagPolls = 0;
 	uint32_t lastHealthLogMs = millis();
@@ -718,6 +724,11 @@ void nfcTaskImpl(void *pvParameters) {
 		if (consumeBuildingResetAcknowledged()) {
 			Serial.println("[NFC] Server confirmed the building reset.");
 			tone(BUZZER_PIN, 2400, 350);
+		}
+		if (bulldozerArmed &&
+			static_cast<int32_t>(millis() - bulldozerExpiresAtMs) >= 0) {
+			bulldozerArmed = false;
+			Serial.println("[NFC] Bulldozer window expired; normal building scans restored.");
 		}
 
 		uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };
@@ -810,6 +821,14 @@ void nfcTaskImpl(void *pvParameters) {
 						debugExecuted = false;
 						Serial.println("[NFC] Debug card recognized; hold it in place for three seconds.");
 						tone(BUZZER_PIN, 1100, 100);
+					} else if (record.payloadLength == 2 &&
+						record.payload[0] == NFC_PROTOCOL_VERSION &&
+						record.payload[1] == ADMIN_COMMAND_BULLDOZER) {
+						bulldozerArmed = true;
+						bulldozerExpiresAtMs = millis() + BULLDOZER_WINDOW_MS;
+						Serial.println("[NFC] Bulldozer card armed; building scans will be removed for ten seconds.");
+						statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+						tone(BUZZER_PIN, 2300, 180);
 					} else {
 						Serial.println("[NFC] Unsupported administrative command record.");
 						statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
@@ -845,6 +864,23 @@ void nfcTaskImpl(void *pvParameters) {
 					record.payload[1] < BUILDING_COUNT;
 				if (validBuildingRecord) {
 					const uint8_t buildingType = record.payload[1];
+					if (bulldozerArmed &&
+						static_cast<int32_t>(millis() - bulldozerExpiresAtMs) < 0) {
+						if (removeBuildingFromServer(uidStr)) {
+							const bool removedLocally = removeScannedBuilding(uidStr);
+							Serial.printf("[NFC] Bulldozer removed building UID %s (type 0x%02X)%s.\n",
+								uidStr.c_str(), buildingType,
+								removedLocally ? " and cleared local scan state" : "");
+							statusLedNotifyNfcEvent(StatusNfcEvent::Accepted);
+							tone(BUZZER_PIN, 2200, 110);
+						} else {
+							Serial.printf("[NFC] Bulldozer could not remove building UID %s; server request failed.\n",
+								uidStr.c_str());
+							statusLedNotifyNfcEvent(StatusNfcEvent::Rejected);
+							tone(BUZZER_PIN, 300, 220);
+						}
+						continue;
+					}
 					BuildingScanQueueResult queueResult =
 						queueBuildingScan(uidStr, buildingType);
 
