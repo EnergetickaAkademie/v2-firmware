@@ -62,8 +62,12 @@ checkbox; uncheck MQTT v3 before uploading to install the HTTP-only image.
 
 ## NFC debug portal
 
-The NFC Flasher can write a v2 debug card (`cz.enak:cmd`, payload `02 02`).
-Hold it continuously on the mainboard reader for three seconds. The board then
+The NFC Flasher can write v2 administrative cards. A debug card uses
+`cz.enak:cmd`, payload `02 02`; a bulldozer card uses the same external type
+with payload `02 03`. Present the bulldozer card once, then present building
+cards within ten seconds to remove those buildings from the board and server.
+The window accepts multiple building cards and expires automatically.
+For a debug card, hold it continuously on the mainboard reader for three seconds. The board then
 pauses cloud networking and exposes an AP named `ENAK-<board-username>` (or a
 chip-ID fallback) using the configured debug AP password, `enak-debug` by
 default. Join that AP and open `http://enak.local/`; captive-portal probes are
