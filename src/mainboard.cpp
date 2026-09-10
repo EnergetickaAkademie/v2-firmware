@@ -120,6 +120,118 @@ constexpr uint8_t ADMIN_COMMAND_ENTER_DEBUG = 2;
 constexpr uint8_t ADMIN_COMMAND_BULLDOZER = 3;
 constexpr uint32_t BULLDOZER_WINDOW_MS = 10000;
 constexpr uint8_t NDEF_TNF_EXTERNAL_TYPE = 0x04;
+constexpr size_t PLAYER_CONTROL_COUNT = 5;
+
+enum class PlayerControlPhase : uint8_t {
+	Initial,
+	Playable,
+	Suspended,
+};
+
+PlayerControlPhase playerControlPhase = PlayerControlPhase::Initial;
+int32_t suspendedEncoderValuesMW[PLAYER_CONTROL_COUNT] = {0};
+bool suspendedEncoderValueValid[PLAYER_CONTROL_COUNT] = {false};
+
+void getControlRange(size_t index, int32_t& activeMin, int32_t& activeMax,
+		float& displayCoeff) {
+	activeMin = 0;
+	activeMax = 0;
+	displayCoeff = 0.0f;
+
+	switch(index) {
+		case 0:
+			activeMin = (int32_t)(baseMinMW[7] * connectedCount[7] * currentCoefficient[7]);
+			activeMax = (int32_t)(baseMaxMW[7] * connectedCount[7] * currentCoefficient[7]);
+			displayCoeff = currentCoefficient[7];
+			break;
+		case 1:
+			activeMin = (int32_t)(baseMinMW[5] * connectedCount[5] * currentCoefficient[5]);
+			activeMax = (int32_t)(baseMaxMW[5] * connectedCount[5] * currentCoefficient[5]);
+			displayCoeff = currentCoefficient[5];
+			break;
+		case 2:
+			activeMin = (int32_t)(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) +
+				(int32_t)(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
+			activeMax = (int32_t)(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) +
+				(int32_t)(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
+			displayCoeff = max(currentCoefficient[8], currentCoefficient[6]);
+			break;
+		case 3:
+			activeMin = (int32_t)(baseMinMW[3] * connectedCount[3] * currentCoefficient[3]);
+			activeMax = (int32_t)(baseMaxMW[3] * connectedCount[3] * currentCoefficient[3]);
+			displayCoeff = currentCoefficient[3];
+			break;
+		case 4:
+			activeMin = (int32_t)(baseMinMW[4] * connectedCount[4] * currentCoefficient[4]);
+			activeMax = (int32_t)(baseMaxMW[4] * connectedCount[4] * currentCoefficient[4]);
+			displayCoeff = currentCoefficient[4];
+			break;
+		case 5:
+			activeMin = (int32_t)(baseMinMW[2] * connectedCount[2] * currentCoefficient[2]) +
+				(int32_t)(baseMinMW[1] * connectedCount[1] * currentCoefficient[1]);
+			activeMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]) +
+				(int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
+			displayCoeff = max(currentCoefficient[2], currentCoefficient[1]);
+			break;
+	}
+}
+
+bool hasConfiguredPlayerControlRange() {
+	const uint8_t sourceTypes[] = {7, 5, 8, 6, 3, 4};
+	for (uint8_t type : sourceTypes) {
+		if (baseMinMW[type] != 0 || baseMaxMW[type] != 0) return true;
+	}
+	return false;
+}
+
+bool isControlAvailable(size_t index) {
+	int32_t activeMin = 0;
+	int32_t activeMax = 0;
+	float displayCoeff = 0.0f;
+	getControlRange(index, activeMin, activeMax, displayCoeff);
+	return displayCoeff > 0.0f && activeMax != 0;
+}
+
+void clearSuspendedEncoderValues() {
+	memset(suspendedEncoderValueValid, 0, sizeof(suspendedEncoderValueValid));
+}
+
+void updatePlayerControlPhase(bool gameActive, bool playableRound) {
+	if (!gameActive) {
+		clearSuspendedEncoderValues();
+		playerControlPhase = PlayerControlPhase::Initial;
+		return;
+	}
+
+	if (!playableRound) {
+		if (playerControlPhase == PlayerControlPhase::Playable) {
+			for (size_t i = 0; i < PLAYER_CONTROL_COUNT; ++i) {
+				if (i < encoders.size() && encoders[i]) {
+					suspendedEncoderValuesMW[i] = encoders[i]->get_value();
+					suspendedEncoderValueValid[i] = true;
+				}
+			}
+		}
+		playerControlPhase = PlayerControlPhase::Suspended;
+		return;
+	}
+
+	if (playerControlPhase == PlayerControlPhase::Suspended) {
+		for (size_t i = 0; i < PLAYER_CONTROL_COUNT; ++i) {
+			if (!suspendedEncoderValueValid[i] || i >= encoders.size() || !encoders[i] ||
+				!isControlAvailable(i)) continue;
+
+			int32_t activeMin = 0;
+			int32_t activeMax = 0;
+			float displayCoeff = 0.0f;
+			getControlRange(i, activeMin, activeMax, displayCoeff);
+			encoders[i]->set_value(constrain(suspendedEncoderValuesMW[i], activeMin, activeMax));
+		}
+		clearSuspendedEncoderValues();
+	}
+
+	playerControlPhase = PlayerControlPhase::Playable;
+}
 
 struct NdefRecordView {
 	uint8_t tnf = 0;
@@ -548,87 +660,66 @@ void playResetConfirmedTone() {
 } // namespace
 
 void updateDisplays() {
+	bool gameActive = false;
+	if (!tryGetAuthoritativeGameActive(gameActive)) return;
+	const bool outputsEnabled = gameActive && hasConfiguredPlayerControlRange();
 	int32_t combinedBatteryPump = productionByTypeMW[8] + productionByTypeMW[6];
 	int32_t combinedWindSolar = productionByTypeMW[2] + productionByTypeMW[1];
 
 	debugDisplayValues[2] = productionByTypeMW[7];
-	debugDisplayVisible[2] = currentCoefficient[7] > 0.0;
+	debugDisplayVisible[2] = outputsEnabled && currentCoefficient[7] > 0.0;
 	if (debugDisplayVisible[2]) coalDisplay.displayNumber(debugDisplayValues[2], 0); else coalDisplay.clear();
 	debugDisplayValues[3] = productionByTypeMW[5];
-	debugDisplayVisible[3] = currentCoefficient[5] > 0.0;
+	debugDisplayVisible[3] = outputsEnabled && currentCoefficient[5] > 0.0;
 	if (debugDisplayVisible[3]) hydroDisplay.displayNumber(debugDisplayValues[3], 0); else hydroDisplay.clear();
 	debugDisplayValues[4] = combinedBatteryPump;
-	debugDisplayVisible[4] = currentCoefficient[8] > 0.0 || currentCoefficient[6] > 0.0;
+	debugDisplayVisible[4] = outputsEnabled &&
+		(currentCoefficient[8] > 0.0 || currentCoefficient[6] > 0.0);
 	if (debugDisplayVisible[4]) batteryDisplay.displayNumber(debugDisplayValues[4], 0); else batteryDisplay.clear();
 	debugDisplayValues[5] = productionByTypeMW[3];
-	debugDisplayVisible[5] = currentCoefficient[3] > 0.0;
+	debugDisplayVisible[5] = outputsEnabled && currentCoefficient[3] > 0.0;
 	if (debugDisplayVisible[5]) nuclearDisplay.displayNumber(debugDisplayValues[5], 0); else nuclearDisplay.clear();
 	debugDisplayValues[6] = productionByTypeMW[4];
-	debugDisplayVisible[6] = currentCoefficient[4] > 0.0;
+	debugDisplayVisible[6] = outputsEnabled && currentCoefficient[4] > 0.0;
 	if (debugDisplayVisible[6]) gasDisplay.displayNumber(debugDisplayValues[6], 0); else gasDisplay.clear();
 	debugDisplayValues[7] = combinedWindSolar;
-	debugDisplayVisible[7] = currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0;
+	debugDisplayVisible[7] = outputsEnabled &&
+		(currentCoefficient[2] > 0.0 || currentCoefficient[1] > 0.0);
 	if (debugDisplayVisible[7]) windPvDisplay.displayNumber(debugDisplayValues[7], 0); else windPvDisplay.clear();
 
 	debugDisplayValues[0] = currentTotalConsumption_MW;
 	debugDisplayValues[1] = currentTotalProduction_MW;
-	debugDisplayVisible[0] = consumptionDisp != nullptr;
-	debugDisplayVisible[1] = productionDisp != nullptr;
-	if (consumptionDisp) consumptionDisp->displayNumber(debugDisplayValues[0], 0);
-	if (productionDisp) productionDisp->displayNumber(debugDisplayValues[1], 0);
+	debugDisplayVisible[0] = outputsEnabled && consumptionDisp != nullptr;
+	debugDisplayVisible[1] = outputsEnabled && productionDisp != nullptr;
+	if (consumptionDisp) {
+		if (debugDisplayVisible[0]) consumptionDisp->displayNumber(debugDisplayValues[0], 0);
+		else consumptionDisp->clear();
+	}
+	if (productionDisp) {
+		if (debugDisplayVisible[1]) productionDisp->displayNumber(debugDisplayValues[1], 0);
+		else productionDisp->clear();
+	}
 }
 
 bool updateBargraphs() {
 	bool anyChanged = false;
+	bool gameActive = false;
+	if (!tryGetAuthoritativeGameActive(gameActive)) return false;
+	const bool playableRound = hasConfiguredPlayerControlRange();
+	updatePlayerControlPhase(gameActive, playableRound);
 
 	for (size_t i = 0; i < DEVICE_COUNT; ++i) {
 		if (!encoders[i] || !bargraphs[i]) continue;
 
 		int32_t activeMin = 0;
 		int32_t activeMax = 0;
-		float displayCoeff = 0.0;
-
-		switch(i) {
-			case 0:
-				activeMin = (int32_t)(baseMinMW[7] * connectedCount[7] * currentCoefficient[7]);
-				activeMax = (int32_t)(baseMaxMW[7] * connectedCount[7] * currentCoefficient[7]);
-				displayCoeff = currentCoefficient[7];
-				break;
-			case 1:
-				activeMin = (int32_t)(baseMinMW[5] * connectedCount[5] * currentCoefficient[5]);
-				activeMax = (int32_t)(baseMaxMW[5] * connectedCount[5] * currentCoefficient[5]);
-				displayCoeff = currentCoefficient[5];
-				break;
-			case 2:
-				activeMin = (int32_t)(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) +
-							(int32_t)(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
-				activeMax = (int32_t)(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) +
-							(int32_t)(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
-				displayCoeff = max(currentCoefficient[8], currentCoefficient[6]);
-				break;
-			case 3:
-				activeMin = (int32_t)(baseMinMW[3] * connectedCount[3] * currentCoefficient[3]);
-				activeMax = (int32_t)(baseMaxMW[3] * connectedCount[3] * currentCoefficient[3]);
-				displayCoeff = currentCoefficient[3];
-				break;
-			case 4:
-				activeMin = (int32_t)(baseMinMW[4] * connectedCount[4] * currentCoefficient[4]);
-				activeMax = (int32_t)(baseMaxMW[4] * connectedCount[4] * currentCoefficient[4]);
-				displayCoeff = currentCoefficient[4];
-				break;
-			case 5:
-				activeMin = (int32_t)(baseMinMW[2] * connectedCount[2] * currentCoefficient[2]) +
-							(int32_t)(baseMinMW[1] * connectedCount[1] * currentCoefficient[1]);
-				activeMax = (int32_t)(baseMaxMW[2] * connectedCount[2] * currentCoefficient[2]) +
-							(int32_t)(baseMaxMW[1] * connectedCount[1] * currentCoefficient[1]);
-				displayCoeff = max(currentCoefficient[2], currentCoefficient[1]);
-				break;
-		}
+		float displayCoeff = 0.0f;
+		getControlRange(i, activeMin, activeMax, displayCoeff);
 
 		int32_t val = encoders[i]->get_value();
 		float pct = 0.0f;
 
-		if (displayCoeff <= 0.0 || activeMax == 0) {
+		if (!gameActive || !playableRound || displayCoeff <= 0.0 || activeMax == 0) {
 			val = 0;
 			if(encoders[i]->get_value() != 0) {
 				encoders[i]->set_value(0);
@@ -670,16 +761,8 @@ bool updateBargraphs() {
 
 bool getDebugEncoderRange(uint8_t index, int32_t& minimum, int32_t& maximum) {
 	if (index >= 5) return false;
-	const uint8_t type = apiTypeMap[index];
-	if (index == 2) {
-		minimum = static_cast<int32_t>(baseMinMW[8] * connectedCount[8] * currentCoefficient[8]) +
-			static_cast<int32_t>(baseMinMW[6] * connectedCount[6] * currentCoefficient[6]);
-		maximum = static_cast<int32_t>(baseMaxMW[8] * connectedCount[8] * currentCoefficient[8]) +
-			static_cast<int32_t>(baseMaxMW[6] * connectedCount[6] * currentCoefficient[6]);
-	} else {
-		minimum = static_cast<int32_t>(baseMinMW[type] * connectedCount[type] * currentCoefficient[type]);
-		maximum = static_cast<int32_t>(baseMaxMW[type] * connectedCount[type] * currentCoefficient[type]);
-	}
+	float displayCoeff = 0.0f;
+	getControlRange(index, minimum, maximum, displayCoeff);
 	return true;
 }
 

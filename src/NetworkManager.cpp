@@ -677,6 +677,7 @@ void pollGameState() {
         if (http.getSize() == 0) {
             // An inactive game is represented by an empty legacy response.
             // Do not enter a blocking stream read or discard the last valid state.
+            setAuthoritativeGameActive(false);
             setBuildingScanScenarioState(false, true);
             statusLedRecordApiSuccess();
             http.end();
@@ -719,6 +720,7 @@ void pollGameState() {
             Serial.println("[Net] /poll_binary body was incomplete or invalid; keeping previous state.");
             statusLedRecordApiFailure(StatusApiError::InvalidResponse);
         } else {
+            setAuthoritativeGameActive(true);
             setBuildingScanScenarioState(true, false);
             statusLedRecordApiSuccess();
         }
@@ -949,11 +951,14 @@ SyncV2Result syncBoardV2() {
         (configRevision != lastConfigRevision && allBuildingCountsZero);
     setBuildingScanScenarioState(gameActive, resetScanCache);
 
+    beginAuthoritativeStateUpdate();
     memcpy(currentCoefficient, nextCoefficients, sizeof(nextCoefficients));
     memcpy(baseMinMW, nextMin, sizeof(nextMin));
     memcpy(baseMaxMW, nextMax, sizeof(nextMax));
     memcpy(buildingConsumptionMW, nextConsumption, sizeof(nextConsumption));
     memcpy(authoritativeBuildingCounts, nextCounts, sizeof(nextCounts));
+    setAuthoritativeGameActive(gameActive);
+    endAuthoritativeStateUpdate();
 
     if (configRevision != lastConfigRevision) {
         Serial.printf("[Net] Applied sync v2 config revision %u (%s).\n",
@@ -1162,10 +1167,12 @@ void networkTaskImpl(void *pvParameters) {
 
             if (useLegacyProtocol && now - lastPollMs >= POLL_INTERVAL) {
                 lastPollMs = now;
+                beginAuthoritativeStateUpdate();
                 pollGameState();
 
                 // A previous request may have invalidated the token.
                 if (jwtToken != "") pollProductionRanges();
+                endAuthoritativeStateUpdate();
                 if (jwtToken != "") pollConsumptionValues();
                 if (jwtToken != "") pollBuildingCounts();
             }

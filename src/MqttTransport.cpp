@@ -189,11 +189,14 @@ void applyQueuedState() {
         nextConsumption[i] = static_cast<uint32_t>(next.values[27 + i] / 1000);
     }
     setBuildingScanScenarioState(gameActive, !gameActive);
+    beginAuthoritativeStateUpdate();
     memcpy(currentCoefficient, nextCoefficients, sizeof(nextCoefficients));
     memcpy(baseMinMW, nextMin, sizeof(nextMin));
     memcpy(baseMaxMW, nextMax, sizeof(nextMax));
     memcpy(buildingConsumptionMW, nextConsumption, sizeof(nextConsumption));
     memcpy(authoritativeBuildingCounts, next.counts, sizeof(next.counts));
+    setAuthoritativeGameActive(gameActive);
+    endAuthoritativeStateUpdate();
     appliedRevision = next.revision;
     stateApplied = true;
     ready = true;

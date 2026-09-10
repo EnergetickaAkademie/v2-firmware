@@ -34,6 +34,9 @@ bool buildingScanningActive = false;
 bool buildingResetPending = false;
 bool buildingResetAcknowledged = false;
 uint32_t buildingResetReadyAtMs = 0;
+bool authoritativeGameActive = false;
+bool authoritativeStateUpdateInProgress = false;
+portMUX_TYPE authoritativeGameActiveMux = portMUX_INITIALIZER_UNLOCKED;
 
 constexpr const char* BOARD_STATE_NAMESPACE = "board_state";
 constexpr const char* RESET_PENDING_KEY = "reset_pending";
@@ -61,6 +64,32 @@ void persistResetPending(bool pending) {
 	preferences.putBool(RESET_PENDING_KEY, pending);
 	preferences.end();
 }
+}
+
+void beginAuthoritativeStateUpdate() {
+	portENTER_CRITICAL(&authoritativeGameActiveMux);
+	authoritativeStateUpdateInProgress = true;
+	portEXIT_CRITICAL(&authoritativeGameActiveMux);
+}
+
+void endAuthoritativeStateUpdate() {
+	portENTER_CRITICAL(&authoritativeGameActiveMux);
+	authoritativeStateUpdateInProgress = false;
+	portEXIT_CRITICAL(&authoritativeGameActiveMux);
+}
+
+void setAuthoritativeGameActive(bool active) {
+	portENTER_CRITICAL(&authoritativeGameActiveMux);
+	authoritativeGameActive = active;
+	portEXIT_CRITICAL(&authoritativeGameActiveMux);
+}
+
+bool tryGetAuthoritativeGameActive(bool& active) {
+	portENTER_CRITICAL(&authoritativeGameActiveMux);
+	const bool ready = !authoritativeStateUpdateInProgress;
+	active = authoritativeGameActive;
+	portEXIT_CRITICAL(&authoritativeGameActiveMux);
+	return ready;
 }
 
 void initPersistentGameState() {

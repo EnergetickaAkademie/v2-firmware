@@ -53,6 +53,10 @@ enum class BuildingScanQueueResult {
 };
 
 void initPersistentGameState();
+void beginAuthoritativeStateUpdate();
+void endAuthoritativeStateUpdate();
+void setAuthoritativeGameActive(bool active);
+bool tryGetAuthoritativeGameActive(bool& active);
 BuildingScanQueueResult queueBuildingScan(const String& uid, uint8_t type);
 bool hasBuildingBeenScanned(const String& uid);
 std::vector<ScannedBuilding> scannedBuildingsSnapshot();
