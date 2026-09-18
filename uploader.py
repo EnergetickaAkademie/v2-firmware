@@ -438,7 +438,12 @@ class PowerplantManager(QWidget):
 	def __init__(self):
 		super().__init__()
 		
-		self.board_types = ["Powerplant", "Substation", "Mainboard"]
+		self.board_types = [
+			"Powerplant",
+			"Powerplant (v1 ESP8266)",
+			"Substation",
+			"Mainboard",
+		]
 		self.device_types = [
 			"TYPE_UNKNOWN", "TYPE_NPP", "TYPE_GAS", "TYPE_BATTERY", 
 			"TYPE_COAL", "TYPE_WIND", "TYPE_HYDRO", "TYPE_HYDRO_PUMPED", "TYPE_SOLAR"
@@ -570,13 +575,14 @@ class PowerplantManager(QWidget):
 
 	def update_board_ui(self):
 		board_kind = self.board_combo.currentText()
-		is_powerplant = board_kind == "Powerplant"
+		is_powerplant = board_kind in ("Powerplant", "Powerplant (v1 ESP8266)")
 		is_mainboard = board_kind == "Mainboard"
 		self.type_combo.setEnabled(is_powerplant)
 		self.type_combo.setVisible(is_powerplant)
 		self.mainboard_form_widget.setVisible(is_mainboard)
 		self.upload_btn.setText({
 			"Powerplant": "Generate UID and Upload",
+			"Powerplant (v1 ESP8266)": "Upload V1 Powerplant",
 			"Substation": "Upload Substation",
 			"Mainboard": "Upload Mainboard",
 		}.get(board_kind, "Upload"))
@@ -649,6 +655,7 @@ class PowerplantManager(QWidget):
 			if env_name is None:
 				env_name = {
 					"Powerplant": "powerplant",
+					"Powerplant (v1 ESP8266)": "powerplant_v1",
 					"Substation": "substation",
 					"Mainboard": "mainboard",
 				}.get(board_kind)
@@ -973,6 +980,24 @@ class PowerplantManager(QWidget):
 			self.upload_thread.start()
 			return
 
+		if board_kind == "Powerplant (v1 ESP8266)":
+			selected_type = self.type_combo.currentText()
+			if selected_type == "TYPE_UNKNOWN":
+				self.log("ERROR: Select a powerplant type before uploading v1 firmware.")
+				self.upload_btn.setEnabled(True)
+				return
+
+			build_flags = f"-DDEVICE_TYPE={selected_type}"
+			self.upload_thread = PioUploadThread("powerplant_v1", build_flags, selected_port)
+			self.upload_thread.log_signal.connect(self.log)
+			self.upload_thread.finished_signal.connect(
+				lambda success: self.on_upload_finished(
+					success, "powerplant_v1", board_kind, selected_type=selected_type
+				)
+			)
+			self.upload_thread.start()
+			return
+
 		if board_kind == "Substation":
 			self.upload_thread = PioUploadThread("substation", None, selected_port)
 			self.upload_thread.log_signal.connect(self.log)
@@ -1016,6 +1041,11 @@ class PowerplantManager(QWidget):
 			if board_kind == "Powerplant" and hex_uid and selected_type:
 				self.save_uid(hex_uid, selected_type)
 				self.log(f"\nSUCCESS: Upload complete. {hex_uid} assigned to {selected_type} and saved.")
+			elif board_kind == "Powerplant (v1 ESP8266)":
+				self.log(
+					f"\nSUCCESS: V1 ESP8266 powerplant upload complete for {selected_type}. "
+					"The board UID is derived from its ESP8266 chip ID."
+				)
 			elif board_kind == "Substation":
 				self.log("\nSUCCESS: Substation upload complete.")
 			else:
@@ -1026,6 +1056,8 @@ class PowerplantManager(QWidget):
 		else:
 			if board_kind == "Powerplant":
 				self.log("\nFAILED: Upload aborted. UID not saved.")
+			elif board_kind == "Powerplant (v1 ESP8266)":
+				self.log("\nFAILED: V1 ESP8266 powerplant upload aborted.")
 			elif board_kind == "Substation":
 				self.log("\nFAILED: Substation upload aborted.")
 			else:

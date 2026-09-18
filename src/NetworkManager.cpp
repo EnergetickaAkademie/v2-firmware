@@ -452,6 +452,7 @@ bool advanceWiFiSetup(uint32_t now) {
         now - wifiSetupPhaseStartedAt >= 1000) {
         Serial.println("[Net] Setting Station Mode...");
         WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
         WiFi.setAutoReconnect(true);
 
         Serial.printf("[Net] Connecting to WiFi: %s\n", activeWifiSsid.c_str());

@@ -13,6 +13,38 @@ kick-start, and a 10% stop threshold. Coal and nuclear use binary nebulizer
 control with a five-second restart lockout after shutdown. Active actuators
 stop if commands are absent for 10 seconds.
 
+### V1 ESP8266 powerplant backport
+
+Legacy Wemos D1 mini powerplants can be reflashed to join the v2 PodSync bus
+directly. In `uploader.py`, select **Powerplant (v1 ESP8266)**, choose one of
+the eight concrete powerplant types, select its USB serial port, and click
+**Upload V1 Powerplant**. Unlike a v2 CH32 powerplant, its UID is read from
+`ESP.getChipId()` at runtime and is not generated or stored by the uploader.
+
+| Signal or peripheral | Legacy pin |
+| --- | --- |
+| PodSync DATA | D1 / GPIO5 |
+| PodSync CLOCK | D7 / GPIO13 |
+| RGB LED or atomizer | D2 / GPIO4 |
+| Motor inputs | D5 / GPIO14 and D6 / GPIO12 |
+| Identification LED | D4 / GPIO2, active-low |
+
+Connect the v2 substation clock to D7, data to D1, and ground to ground. The
+existing open-drain data pull-up must remain present. The firmware deliberately
+disables Wi-Fi and supports USB flashing only, which avoids radio activity
+interfering with the bit-banged bus.
+
+The old board has only one peripheral RGB LED. On solar, gas, pumped-hydro,
+and battery modules it displays the RGB value sent by the v2 system. On a
+solar module this means A0 cannot simultaneously drive a separate local solar
+indicator as it does on v2 hardware. The legacy `PowerplantModule/OneWireSlave`
+firmware remains StarWire-only and is used as a hardware reference; it must be
+replaced by the `powerplant_v1` target.
+
+The backport requires the PodSync version that supports `PODSYNC_CLK_PIN` and
+`PODSYNC_DAT_PIN`. Land that PodSync update before using this repository from
+a clean checkout because PlatformIO downloads PodSync from its Git repository.
+
 
 ## ESP32-S3 mainboard OTA
 
@@ -35,8 +67,8 @@ manifest file. Host the generated binary and manifest at the configured HTTPS
 locations before selecting the release in WebControl.
 
 For wired CH32V003 flashing, select **Powerplant** or **Substation** in
-`uploader.py`. Powerplants additionally require a device type and receive a
-generated UID; substations use the fixed `substation` PlatformIO environment.
+`uploader.py`. CH32 powerplants additionally require a device type and receive
+a generated UID; substations use the fixed `substation` PlatformIO environment.
 
 The uploader can also inspect logs without flashing. Select **USB / serial** and
 click **Show serial**, or select **Wi-Fi OTA** and click **Show Wi-Fi log**. The
